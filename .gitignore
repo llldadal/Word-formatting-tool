@@ -1,0 +1,53 @@
+# 构建目录，包含 Qt Creator 和常见 CMake 构建目录。
+build/
+build-*/
+cmake-build-*/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# Qt 构建缓存与自动生成文件，任意层级的 .qt 目录都忽略。
+.qt/
+*_autogen/
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Qt Creator 的本机配置和索引。
+CMakeLists.txt.user*
+*.pro.user*
+.qtc_clangd/
+
+# CMake、Ninja 和 Make 生成的构建文件。
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+compile_commands.json
+Testing/
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+Makefile
+Makefile.*
+
+# 编译、链接和调试产物。
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+
+# Word 文档，包括其临时文件。
+*.[dD][oO][cC][xX]
