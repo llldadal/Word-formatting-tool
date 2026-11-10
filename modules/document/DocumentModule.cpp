@@ -5,6 +5,7 @@
 #include <QLockFile>
 #include <QSettings>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -82,10 +83,73 @@ std::optional<ContainerId> Document::addGroup(const ContainerId& parentId)
     return addNode(parentId, std::move(node));
 }
 
-std::optional<ContainerId> Document::addNode(const ContainerId& parentId,
-                                             ContainerNode node)
+bool Document::moveNode(const ContainerId& id, const ContainerId& targetParentId,
+                        std::size_t index, std::optional<QPointF> position)
 {
-    DocumentNode* const parent = nodesById_.value(parentId, nullptr);
+    DocumentNode* const node = findNode(id);
+    DocumentNode* const targetParent = findNode(targetParentId);
+    const auto placement = placementForChild(targetParent);
+    if (node == nullptr || node == root_.get() || node == targetParent || !placement) {
+        return false;
+    }
+    // 顶层容器下面只允许一层子节点，移入的节点必须是叶节点。
+    if (targetParent != root_.get() && !node->children_.empty()) {
+        return false;
+    }
+
+    const bool sameParent = node->parent_ == targetParent;
+    auto& targetChildren = targetParent->children_;
+    // 下标按移动后的子节点数量校验，换父时目标列表会增加一个子节点。
+    const auto finalChildCount = targetChildren.size() + (sameParent ? 0 : 1);
+    if (index >= finalChildCount) {
+        return false;
+    }
+    if (!sameParent && *placement == PlacementMode::Floating && !position) {
+        return false;
+    }
+    if (position && (!std::isfinite(position->x()) || !std::isfinite(position->y()))) {
+        return false;
+    }
+
+    auto& sourceChildren = node->parent_->children_;
+    const auto source = std::find_if(sourceChildren.begin(), sourceChildren.end(),
+                                     [node](const auto& child) { return child.get() == node; });
+    const auto target = targetChildren.begin() + static_cast<std::ptrdiff_t>(index);
+    auto& currentPosition = node->data_.geometry.position;
+    // 同级重排省略 position 时，沿用原来的期望坐标。
+    const QPointF newPosition = position.value_or(sameParent ? currentPosition : QPointF{});
+    const bool samePosition = currentPosition.x() == newPosition.x() &&
+                              currentPosition.y() == newPosition.y();
+    if (sameParent && source == target && samePosition) {
+        // 请求的位置已经满足，成功返回，版本号无需推进。
+        return true;
+    }
+
+    if (!sameParent) {
+        // 先插入目标列表。若扩容失败，原列表仍持有该节点。
+        targetChildren.insert(target, std::move(*source));
+        sourceChildren.erase(source);
+        node->parent_ = targetParent;
+        node->data_.placement = *placement;
+    } else if (source < target) {
+        std::rotate(source, source + 1, target + 1);
+    } else if (source > target) {
+        std::rotate(target, source, source + 1);
+    }
+
+    // 移动沿用原有的 minimumHeight，实际框高由重新排版计算。
+    currentPosition = newPosition;
+    ++revision_;
+    return true;
+}
+
+DocumentNode* Document::findNode(const ContainerId& id)
+{
+    return nodesById_.value(id, nullptr);
+}
+
+std::optional<PlacementMode> Document::placementForChild(const DocumentNode* parent) const
+{
     if (parent == nullptr || parent->data_.type == ContainerType::Image) {
         return std::nullopt;
     }
@@ -95,15 +159,25 @@ std::optional<ContainerId> Document::addNode(const ContainerId& parentId,
         return std::nullopt;
     }
 
+    return parent->data_.type == ContainerType::Text ? PlacementMode::Floating : PlacementMode::Flow;
+}
+
+std::optional<ContainerId> Document::addNode(const ContainerId& parentId,
+                                             ContainerNode node)
+{
+    DocumentNode* const parent = findNode(parentId);
+    const auto placement = placementForChild(parent);
+    if (!placement) {
+        return std::nullopt;
+    }
+
     auto id = allocateId();
     if (!id || nodesById_.contains(*id)) {
         return std::nullopt;
     }
 
     node.id = *id;
-    node.placement = parent->data_.type == ContainerType::Text
-        ? PlacementMode::Floating
-        : PlacementMode::Flow;
+    node.placement = *placement;
 
     auto& children = parent->children_;
     children.push_back(std::make_unique<DocumentNode>(std::move(node), parent));

@@ -3,6 +3,7 @@
 
 #include "DocumentSnapshot.h"
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -35,7 +36,16 @@ public:
                                               const QSizeF& displaySize);
     std::optional<data::ContainerId> addGroup(const data::ContainerId& parentId);
 
+    // index 是移动完成后从 0 开始的下标。换父时可插到目标列表末尾。
+    // 移入正文时需给出相对新父内容区的位置。
+    // 省略 position 时，同级移动沿用原位置，换到顺序排版的父节点则使用 (0, 0) 作为期望位置。
+    bool moveNode(const data::ContainerId& id, const data::ContainerId& targetParentId,
+                  std::size_t index, std::optional<QPointF> position = std::nullopt);
+
 private:
+    // 未找到时返回 nullptr。节点指针仅在当前操作中使用。
+    DocumentNode* findNode(const data::ContainerId& id);
+    std::optional<data::PlacementMode> placementForChild(const DocumentNode* parent) const;
     std::optional<data::ContainerId> addNode(const data::ContainerId& parentId,
                                              data::ContainerNode data);
     std::optional<data::ContainerId> allocateId();
