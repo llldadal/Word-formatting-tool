@@ -1,6 +1,304 @@
 #include "LayoutModule.h"
+#include <QTextCharFormat>
+#include <QFont>
+#include <QTextOption>
+#include <memory>
 
 namespace editor::layout {
+
+static data::TextStyle mergeTextStyle(
+    data::TextStyle base, const data::TextStyleOverride& change)
+{
+    if (change.fontFamily.has_value())
+        base.fontFamily = *change.fontFamily;
+    if (change.fontSizePt.has_value())
+        base.fontSizePt = *change.fontSizePt;
+    if (change.color.has_value())
+        base.color = *change.color;
+    if (change.bold.has_value())
+        base.bold = *change.bold;
+    if (change.italic.has_value())
+        base.italic = *change.italic;
+    if (change.underline.has_value())
+        base.underline = *change.underline;
+    return base;
+}
+
+static QTextCharFormat makeCharFormat(const data::TextStyle& style)
+{
+    QFont font(style.fontFamily);
+    font.setPixelSize(qRound(style.fontSizePt * data::DocumentUnitsPerInch / 72.0));
+    font.setBold(style.bold);
+    font.setItalic(style.italic);
+    font.setUnderline(style.underline);
+
+    QTextCharFormat format;
+    format.setFont(font);
+    format.setForeground(style.color);
+    return format;
+}
+
+static std::vector<QRectF> availableTextAreas(
+    const QRectF& lineArea, const std::vector<QRectF>& obstacles)
+{
+    std::vector<QRectF> areas{lineArea};
+    for (const auto& obstacle : obstacles)
+    {
+        std::vector<QRectF> remaining;
+        for (const auto& area : areas)
+        {
+            if (!area.intersects(obstacle))
+            {
+                remaining.push_back(area);
+                continue;
+            }
+
+            if (area.left() < obstacle.left())
+            {
+                remaining.emplace_back(area.left(), area.top(),
+                                       obstacle.left() - area.left(), area.height());
+            }
+            if (obstacle.right() < area.right())
+            {
+                remaining.emplace_back(obstacle.right(), area.top(),
+                                       area.right() - obstacle.right(), area.height());
+            }
+        }
+        areas.swap(remaining);
+    }
+    return areas;
+}
+
+static qreal layoutText(
+    const data::ContainerNode& node,
+    const QRectF& contentRect,
+    const std::vector<QRectF>& obstacles,
+    data::LayoutResult& result)
+{
+
+    QTextOption option;
+    option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    option.setUseDesignMetrics(true);
+
+    qreal lineY = contentRect.top();
+    for (const auto& paragraph : node.text.paragraphs)
+    {
+        const auto& range = paragraph.range;
+        const auto& format = paragraph.format;
+        lineY += format.spaceBefore;
+
+        const auto baseStyle = mergeTextStyle(
+            node.text.defaultStyle, paragraph.defaultStyle);
+        const auto baseFormat = makeCharFormat(baseStyle);
+        auto layout = std::make_shared<QTextLayout>(
+            node.text.text.mid(range.start, range.end - range.start),
+            baseFormat.font());
+        switch (format.alignment)
+        {
+        case data::ParagraphAlignment::Left:
+            option.setAlignment(Qt::AlignLeft);
+            break;
+        case data::ParagraphAlignment::Center:
+            option.setAlignment(Qt::AlignHCenter);
+            break;
+        case data::ParagraphAlignment::Right:
+            option.setAlignment(Qt::AlignRight);
+            break;
+        case data::ParagraphAlignment::Justify:
+            option.setAlignment(Qt::AlignJustify);
+            break;
+        }
+        layout->setTextOption(option);
+        layout->setCacheEnabled(true);
+
+        QList<QTextLayout::FormatRange> formats;
+        int next = range.start;
+
+        for (const auto& span : node.text.formatSpans)
+        {
+            const int start = qMax(range.start, span.range.start);
+            const int end = qMin(range.end, span.range.end);
+            if (start >= end)
+                continue;
+
+            if (next < start)
+                formats.push_back({next - range.start, start - next, baseFormat});
+
+            const auto localFormat = makeCharFormat(mergeTextStyle(baseStyle, span.style));
+            formats.push_back({start - range.start, end - start, localFormat});
+            next = end;
+        }
+
+        if (next < range.end)
+            formats.push_back({next - range.start, range.end - next, baseFormat});
+
+        layout->setFormats(formats);
+
+        const int layoutIndex = static_cast<int>(result.textLayouts.size());
+        int lineIndex = 0;
+        layout->beginLayout();
+
+        bool finished = false;
+        while (!finished)
+        {
+            const qreal indent = format.leftIndent
+                                 + (lineIndex == 0 ? format.firstLineIndent : 0);
+            const qreal lineWidth = qMax(
+                qreal(0), contentRect.width() - indent - format.rightIndent);
+            const QRectF lineArea(contentRect.left() + indent, lineY,
+                                  lineWidth, format.lineHeight);
+            const auto areas = availableTextAreas(lineArea, obstacles);
+
+            // 整行被挡住时，向下移一行，原文位置不动。
+            bool advanceRow = areas.empty();
+            for (const auto& area : areas)
+            {
+                auto line = layout->createLine();
+                if (!line.isValid())
+                {
+                    finished = true;
+                    break;
+                }
+
+                line.setLineWidth(area.width());
+                line.setPosition(area.topLeft());
+
+                const int start = range.start + line.textStart();
+                const int end = start + line.textLength();
+                result.textFragments.push_back({
+                    node.id, {start, end}, area, layoutIndex, lineIndex
+                });
+                result.layoutBounds = result.layoutBounds.united(area);
+                ++lineIndex;
+                advanceRow = true;
+
+                if (end >= range.end)
+                {
+                    finished = true;
+                    break;
+                }
+            }
+
+            if (advanceRow)
+                lineY += format.lineHeight;
+        }
+        layout->endLayout();
+        result.textLayouts.push_back(layout);
+        lineY += format.spaceAfter;
+    }
+
+    return lineY;
+}
+
+static qreal layoutChildren(
+    const data::DocumentSnapshot& document,
+    const std::vector<data::ContainerNode>& children,
+    const QRectF& parentContent,
+    const data::ContainerId& parentId,
+    data::LayoutResult& result)
+{
+    qreal previousOuterBottom = parentContent.top();
+
+    qreal furthestOuterBottom = parentContent.top();
+
+    for (const auto& node : children)
+    {
+        const auto& geometry = node.geometry;
+        const auto& padding = geometry.padding;
+        const auto& margin = geometry.margin;
+
+        const bool isFloating = node.placement == data::PlacementMode::Floating;
+        qreal x = parentContent.left() + geometry.position.x();
+        qreal y = parentContent.top() + geometry.position.y();
+
+        if (!isFloating)
+        {
+            x = qMax(x, parentContent.left() + margin.left());
+            y = qMax(y, previousOuterBottom + margin.top());
+        }
+
+        qreal width = geometry.width == 0
+                          ? parentContent.width() - margin.left() - margin.right()
+                          : geometry.width;
+
+        qreal initialHeight = qMax(
+            geometry.minimumHeight, padding.top() + padding.bottom());
+
+        if (node.type == data::ContainerType::Image)
+        {
+            width = node.image.displaySize.width()
+            + padding.left() + padding.right();
+
+            const qreal imageFrameHeight = node.image.displaySize.height()
+                                           + padding.top() + padding.bottom();
+
+            initialHeight = qMax(initialHeight, imageFrameHeight);
+        }
+
+        data::ContainerLayout boxLayout;
+        boxLayout.containerId = node.id;
+        boxLayout.parentId = parentId;
+        boxLayout.rect = QRectF(x, y, width, initialHeight);
+        boxLayout.contentRect = boxLayout.rect.adjusted(
+            padding.left(), padding.top(), -padding.right(), -padding.bottom());
+
+        // 先给父容器留一个位置，让输出里父容器排在子容器前面。
+        const auto boxIndex = result.containers.size();
+        result.containers.emplace_back();
+
+        qreal contentBottom = boxLayout.contentRect.top();
+        if (!node.children.empty())
+        {
+            contentBottom = layoutChildren(
+                document, node.children, boxLayout.contentRect, node.id, result);
+        }
+        if (node.type == data::ContainerType::Text)
+        {
+            std::vector<QRectF> obstacles;
+            for (auto i = boxIndex + 1; i < result.containers.size(); ++i)
+            {
+                const auto& childBox = result.containers[i];
+                if (childBox.parentId == node.id)
+                    obstacles.push_back(childBox.outerRect);
+            }
+
+            const qreal textBottom = layoutText(
+                node, boxLayout.contentRect, obstacles, result);
+            contentBottom = qMax(contentBottom, textBottom);
+        }
+
+        const qreal requiredHeight = contentBottom + padding.bottom() - y;
+        const qreal finalHeight = qMax(initialHeight, requiredHeight);
+        boxLayout.rect.setHeight(finalHeight);
+        boxLayout.contentRect.setHeight(
+            finalHeight - padding.top() - padding.bottom());
+
+        boxLayout.outerRect = boxLayout.rect.adjusted(
+            -margin.left(), -margin.top(), margin.right(), margin.bottom());
+        if (node.type == data::ContainerType::Image)
+        {
+            const auto sourceImage =
+                document.resources.value(node.image.resourceId);
+
+            data::ImageLayout imageLayout;
+            imageLayout.containerId = node.id;
+            imageLayout.resourceId = node.image.resourceId;
+            imageLayout.sourceRect = QRectF(
+                QPointF(0, 0), QSizeF(sourceImage.size()));
+            imageLayout.rect = QRectF(
+                boxLayout.contentRect.topLeft(), node.image.displaySize);
+
+            result.images.push_back(imageLayout);
+        }
+        result.containers[boxIndex] = boxLayout;
+        result.layoutBounds = result.layoutBounds.united(boxLayout.outerRect);
+        furthestOuterBottom = qMax(furthestOuterBottom, boxLayout.outerRect.bottom());
+        if (!isFloating)
+            previousOuterBottom = boxLayout.outerRect.bottom();
+    }
+
+    return furthestOuterBottom;
+}
 
 data::LayoutResult composeLayout(const data::DocumentSnapshot& document)
 {
@@ -28,6 +326,8 @@ data::LayoutResult composeLayout(const data::DocumentSnapshot& document)
         contentHeight
         );
 
+    layoutChildren(
+        document,document.root.children, result.contentRect, {}, result);
     return result;
 }
 
