@@ -83,7 +83,7 @@ bool exportCase(const char* caseId, ExportedCase* out, bool* structureOk)
     return true;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 int main(int argc, char** argv)
 {
@@ -91,7 +91,7 @@ int main(int argc, char** argv)
     QGuiApplication app(argc, argv);
     std::printf("===== IO self-check: DOCX export =====\n");
 
-    // ---- case 01: title + two body paragraphs ----
+    // ---- 用例 01：标题 + 两段正文 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -119,7 +119,7 @@ int main(int argc, char** argv)
               "case 01 page margin 44px -> 660 twip");
     }
 
-    // ---- case 02: single floating image with square wrap ----
+    // ---- 用例 02：单张浮动图片 + 四周型绕排 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -146,7 +146,7 @@ int main(int argc, char** argv)
               "case 02 image relationship registered");
     }
 
-    // ---- case 03: two floating images ----
+    // ---- 用例 03：两张浮动图片 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -164,7 +164,7 @@ int main(int argc, char** argv)
               "case 03 stores two distinct media files");
     }
 
-    // ---- case 04: inline image after body ----
+    // ---- 用例 04：正文后的行内图片 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -182,7 +182,7 @@ int main(int argc, char** argv)
               "case 04 has 4 paragraphs (title, p1, p2, image)");
     }
 
-    // ---- case 06: floating text box with square wrap ----
+    // ---- 用例 06：浮动文本框 + 四周型绕排 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -202,7 +202,7 @@ int main(int argc, char** argv)
               "case 06 note text appears in both branches");
     }
 
-    // ---- case 07: heading + paragraph formats + run overrides ----
+    // ---- 用例 07：标题、段落格式与字符格式覆盖 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -227,7 +227,7 @@ int main(int argc, char** argv)
               "case 07 has 3 paragraphs");
     }
 
-    // ---- case 08: floating object beyond fixed page -> compatibility error ----
+    // ---- 用例 08：浮动对象越出固定纸面，应报兼容性错误 ----
     {
         const LayoutCase fixture = makeLayoutCase(QStringLiteral("08"));
         const auto layout = makeStandardLayout(QStringLiteral("08"));
@@ -238,7 +238,7 @@ int main(int argc, char** argv)
               "case 08 error names container photo1");
     }
 
-    // ---- case 09: group box model and margin sums ----
+    // ---- 用例 09：分组盒模型与边距累加 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -253,7 +253,7 @@ int main(int argc, char** argv)
               "case 09 has 3 paragraphs");
     }
 
-    // ---- case 10: UTF-16 offsets, emoji, empty paragraphs ----
+    // ---- 用例 10：UTF-16 偏移、emoji、空段落 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -268,7 +268,7 @@ int main(int argc, char** argv)
               "case 10 has 4 paragraphs including empties");
     }
 
-    // ---- case 11: empty document ----
+    // ---- 用例 11：空文档 ----
     {
         ExportedCase c;
         bool structureOk = false;
@@ -281,7 +281,7 @@ int main(int argc, char** argv)
               "case 11 has section properties");
     }
 
-    // ---- determinism: same input builds identical bytes ----
+    // ---- 确定性：相同输入生成完全相同的字节 ----
     {
         const LayoutCase fixture = makeLayoutCase(QStringLiteral("02"));
         const auto layout = makeStandardLayout(QStringLiteral("02"));
@@ -291,7 +291,7 @@ int main(int argc, char** argv)
               "identical input builds identical package");
     }
 
-    // ---- revision mismatch is an IO error ----
+    // ---- 版本不一致应返回 IO 错误 ----
     {
         const LayoutCase fixture = makeLayoutCase(QStringLiteral("01"));
         auto layout = makeStandardLayout(QStringLiteral("01"));
@@ -303,7 +303,7 @@ int main(int argc, char** argv)
               "revision mismatch carries a reason");
     }
 
-    // ---- file roundtrip and invalid path ----
+    // ---- 文件写出与非法路径 ----
     {
         const LayoutCase fixture = makeLayoutCase(QStringLiteral("01"));
         const auto layout = makeStandardLayout(QStringLiteral("01"));
@@ -325,7 +325,7 @@ int main(int argc, char** argv)
               "invalid path returns IO error");
     }
 
-    // ---- write Word-openable artifacts next to the executable ----
+    // ---- 在可执行文件旁写出可用 Word 打开的产物 ----
     {
         const QString outDir = QCoreApplication::applicationDirPath()
                                  + QStringLiteral("/io-export");

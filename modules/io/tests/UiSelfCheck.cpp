@@ -175,7 +175,7 @@ bool hasDarkTextPixels(const QString& path)
     return dark > 150;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 int main(int argc, char** argv)
 {

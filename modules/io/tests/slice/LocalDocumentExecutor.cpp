@@ -197,7 +197,7 @@ void applyParagraphFormat(TextContent& content,
     }
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 ApplyResult applyRequests(const data::DocumentSnapshot& doc,
                           const std::vector<interaction::EditRequest>& requests)
@@ -235,4 +235,4 @@ ApplyResult applyRequests(const data::DocumentSnapshot& doc,
     return result;
 }
 
-} // namespace editor::slice
+} // 命名空间 editor::slice 结束

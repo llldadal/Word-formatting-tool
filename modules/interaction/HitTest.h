@@ -20,4 +20,4 @@ struct Hit {
 // layout 只读，排版一变调用方就用新的 LayoutResult 重新计算，不缓存矩形。
 Hit hitTest(const data::LayoutResult& layout, QPointF paper);
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

@@ -23,4 +23,4 @@ int prevBoundary(const QString& text, int pos);
 int nextBoundary(const data::DocumentSnapshot& doc, const data::ContainerId& id, int pos);
 int prevBoundary(const data::DocumentSnapshot& doc, const data::ContainerId& id, int pos);
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

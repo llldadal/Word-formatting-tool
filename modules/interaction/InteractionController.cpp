@@ -464,7 +464,7 @@ InteractionOutput setParagraphFormat(const InteractionState& state,
     return out;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 data::TextRange paragraphRangeAt(const data::DocumentSnapshot& doc,
                                  const data::ContainerId& id,
@@ -938,4 +938,4 @@ InteractionOutput InteractionController::refresh(const data::LayoutResult& layou
     return out;
 }
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

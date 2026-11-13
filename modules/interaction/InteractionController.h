@@ -10,30 +10,30 @@
 
 namespace editor::interaction {
 
-// Build a collapsed-caret state at a legal UTF-16 offset.
+// 在合法的 UTF-16 偏移处构造折叠光标状态。
 InteractionState makeInitialState(const data::DocumentSnapshot& doc,
                                   const data::LayoutResult& layout,
                                   const data::ContainerId& id,
                                   int offset = 0);
 
-// Recompute caret, selection, and preedit rectangles after a new layout arrives.
+// 新版面到达后重算光标、选区与预编辑矩形。
 InteractionState refreshStateGeometry(const InteractionState& state,
                                       const data::LayoutResult& layout);
 
-// Paragraph range containing offset. The range excludes the trailing newline.
+// 包含 offset 的整段范围，不含段末换行符。
 data::TextRange paragraphRangeAt(const data::DocumentSnapshot& doc,
                                  const data::ContainerId& id,
                                  int offset);
 
-// Full paragraph ranges overlapped by range. Used for paragraph-level format requests.
+// 与 range 相交的所有整段范围，供段落级格式请求使用。
 std::vector<data::TextRange> paragraphRangesFor(const data::DocumentSnapshot& doc,
                                                 const data::ContainerId& id,
                                                 data::TextRange range);
 
-// Current selected text, or an empty string when there is no non-empty selection.
+// 当前选中文字；没有非空选区时返回空串。
 QString selectedText(const InteractionState& state, const data::DocumentSnapshot& doc);
 
-// Pure event reducers. They do not mutate the document or the layout.
+// 纯事件归约函数，不修改文档，也不修改排版结果。
 InteractionOutput applyAction(const InteractionState& state,
                               const EditAction& action,
                               const data::DocumentSnapshot& doc,
@@ -67,7 +67,7 @@ InteractionOutput applyParagraphFormat(const InteractionState& state,
                                        std::optional<data::ParagraphRole> role = std::nullopt,
                                        std::optional<int> headingLevel = std::nullopt);
 
-// Thin stateful wrapper for the main window. It owns no document or layout.
+// 主窗口用的轻量有状态封装，自身不持有文档或版面。
 class InteractionController {
 public:
     InteractionController() = default;
@@ -121,4 +121,4 @@ private:
     InteractionState state_;
 };
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

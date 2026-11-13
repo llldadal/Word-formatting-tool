@@ -123,7 +123,7 @@ bool walkCentral(const QByteArray& bytes, std::vector<CentralRecord>* records,
     return true;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 QByteArray buildStoreArchive(const std::vector<ZipEntry>& entries)
 {
@@ -136,16 +136,16 @@ QByteArray buildStoreArchive(const std::vector<ZipEntry>& entries)
         const quint32 size = quint32(entry.content.size());
         CentralRecord rec{entry.name, crc, size, size, quint32(out.size())};
         put32(&out, kLocalHeaderSig);
-        put16(&out, 20);            // version needed
+        put16(&out, 20);            // 解压所需版本
         put16(&out, kUtf8Flag);     // 文件名按 UTF-8 解释
-        put16(&out, 0);             // method: store
+        put16(&out, 0);             // 压缩方法：不压缩（store）
         put16(&out, kDosTime);
         put16(&out, kDosDate);
         put32(&out, crc);
-        put32(&out, size);          // compressed size
-        put32(&out, size);          // uncompressed size
+        put32(&out, size);          // 压缩后大小
+        put32(&out, size);          // 原始大小
         put16(&out, quint16(name.size()));
-        put16(&out, 0);             // extra length
+        put16(&out, 0);             // 额外字段长度
         out.append(name);
         out.append(entry.content);
         central.push_back(rec);
@@ -154,33 +154,33 @@ QByteArray buildStoreArchive(const std::vector<ZipEntry>& entries)
     for (const CentralRecord& rec : central) {
         const QByteArray name = rec.name.toUtf8();
         put32(&out, kCentralDirSig);
-        put16(&out, 20);            // version made by
-        put16(&out, 20);            // version needed
+        put16(&out, 20);            // 生成版本
+        put16(&out, 20);            // 解压所需版本
         put16(&out, kUtf8Flag);
-        put16(&out, 0);             // method
+        put16(&out, 0);             // 压缩方法
         put16(&out, kDosTime);
         put16(&out, kDosDate);
         put32(&out, rec.crc);
         put32(&out, rec.compressedSize);
         put32(&out, rec.uncompressedSize);
         put16(&out, quint16(name.size()));
-        put16(&out, 0);             // extra
-        put16(&out, 0);             // comment
-        put16(&out, 0);             // disk start
-        put16(&out, 0);             // internal attributes
-        put32(&out, 0);             // external attributes
+        put16(&out, 0);             // 额外字段长度
+        put16(&out, 0);             // 注释长度
+        put16(&out, 0);             // 起始磁盘号
+        put16(&out, 0);             // 内部属性
+        put32(&out, 0);             // 外部属性
         put32(&out, rec.localHeaderOffset);
         out.append(name);
     }
     const quint32 centralSize = quint32(out.size()) - centralOffset;
     put32(&out, kEndOfDirSig);
-    put16(&out, 0);                 // this disk
-    put16(&out, 0);                 // central directory disk
+    put16(&out, 0);                 // 当前磁盘号
+    put16(&out, 0);                 // 中央目录所在磁盘
     put16(&out, quint16(central.size()));
     put16(&out, quint16(central.size()));
     put32(&out, centralSize);
     put32(&out, centralOffset);
-    put16(&out, 0);                 // comment length
+    put16(&out, 0);                 // 注释长度
     return out;
 }
 
@@ -265,4 +265,4 @@ bool extractEntry(const QByteArray& bytes, const QString& name,
     return false;
 }
 
-} // namespace editor::io::zip
+} // 命名空间 editor::io::zip 结束

@@ -39,4 +39,4 @@ private:
     QAction* underline_ = nullptr;
 };
 
-} // namespace editor::demo
+} // 命名空间 editor::demo 结束

@@ -25,4 +25,4 @@ QStringList verifyArchive(const QByteArray& bytes);
 bool extractEntry(const QByteArray& bytes, const QString& name,
                   QByteArray* out, QStringList* issues);
 
-} // namespace editor::io::zip
+} // 命名空间 editor::io::zip 结束

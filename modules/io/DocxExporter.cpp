@@ -76,7 +76,7 @@ void applyOverride(TextStyle* style, const TextStyleOverride& o)
 // ---------- 生成计划 ----------
 
 struct MediaItem {
-    QString partName; // word/media/imageN.png
+    QString partName; // 包内路径，形如 word/media/imageN.png
     QString relId;    // document.xml.rels 中的关系 ID
     QByteArray bytes;
 };
@@ -143,7 +143,7 @@ DocxExportResult collectMedia(const data::DocumentSnapshot& doc,
 // ---------- 段落与文字 ----------
 
 struct ParaOut {
-    int before = 0;     // twip
+    int before = 0;     // 单位 twip
     int after = 0;
     int line = 0;       // 0 表示不写行距。
     int left = 0;
@@ -735,7 +735,7 @@ DocxExportResult validateInput(const data::DocumentSnapshot& doc,
     return {};
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 DocxBuildResult buildDocx(const data::DocumentSnapshot& doc, const LayoutResult& layout)
 {
@@ -814,4 +814,4 @@ DocxExportResult exportDocx(const data::DocumentSnapshot& doc, const LayoutResul
     return {};
 }
 
-} // namespace editor::io
+} // 命名空间 editor::io 结束

@@ -31,7 +31,7 @@ const data::TextFragment* findFragment(const data::LayoutResult& layout, QPointF
     return inside ? inside : nearest;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 Hit hitTest(const data::LayoutResult& layout, QPointF paper)
 {
@@ -60,4 +60,4 @@ Hit hitTest(const data::LayoutResult& layout, QPointF paper)
     return { f->containerId, offset };
 }
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

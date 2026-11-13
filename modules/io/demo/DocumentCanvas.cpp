@@ -72,7 +72,7 @@ QTextCharFormat formatFrom(const data::TextStyleOverride& style)
     return format;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 namespace editor::demo {
 
@@ -476,4 +476,4 @@ QVariant DocumentCanvas::inputMethodQuery(Qt::InputMethodQuery query) const
     return QWidget::inputMethodQuery(query);
 }
 
-} // namespace editor::demo
+} // 命名空间 editor::demo 结束

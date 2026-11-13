@@ -12,4 +12,4 @@ namespace editor::slice {
 
 data::LayoutResult projectLayout(const data::DocumentSnapshot& doc);
 
-} // namespace editor::slice
+} // 命名空间 editor::slice 结束

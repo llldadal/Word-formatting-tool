@@ -22,4 +22,4 @@ struct ApplyResult {
 ApplyResult applyRequests(const data::DocumentSnapshot& doc,
                           const std::vector<interaction::EditRequest>& requests);
 
-} // namespace editor::slice
+} // 命名空间 editor::slice 结束

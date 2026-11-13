@@ -1,6 +1,6 @@
-// Interaction module self-check.
-// Uses only the repository fixtures and standard layouts; no other team module is linked.
-// Covers I01 / I02 / I03 / I04 / I05 / I06 / I07 / I08 and U05 interaction-side behavior.
+// 交互模块自测。
+// 只使用仓库自带的固定输入和标准排版，不链接其他组的模块。
+// 覆盖 I01 / I02 / I03 / I04 / I05 / I06 / I07 / I08，以及 U05 的交互侧行为。
 
 #include "HitTest.h"
 #include "InteractionController.h"
@@ -71,7 +71,7 @@ static int surrogatePairStart(const QString& s)
     return -1;
 }
 
-// I01 / I02 / I05: click positions, container ownership, wrap-around fragments, blank paper.
+// I01 / I02 / I05：点击定位、容器归属、绕排片段、页边空白。
 static void testHitCases()
 {
     const QStringList caseIds = { QStringLiteral("02"), QStringLiteral("03"),
@@ -146,7 +146,7 @@ static void testHitCases()
     }
 }
 
-// I08: grapheme boundaries. Emoji surrogate pairs, combining marks, and empty paragraphs.
+// I08：字形簇边界。emoji 代理对、组合字符、空段落。
 static void testBoundaries()
 {
     out << "\n=== Case 10: UTF-16 grapheme boundaries ===\n";
@@ -196,7 +196,7 @@ static void testBoundaries()
     }
 }
 
-// I04 / I05: normalized ranges, split selection rectangles, Ctrl+A, clamped drag, caret rect.
+// I04 / I05：区间归一化、分段高亮矩形、Ctrl+A、拖选夹取、光标矩形。
 static void testSelection()
 {
     out << "\n=== Case 02: split selection / Ctrl+A / drag outside ===\n";
@@ -268,7 +268,7 @@ static void testSelection()
               .arg(static_cast<int>(noteAll.rects.size())));
 }
 
-// I03 / I06 / I08: typing, paste, Enter, Backspace, Delete, copy, cut, shortcuts, movement.
+// I03 / I06 / I08：输入、粘贴、回车、退格、删除、复制、剪切、快捷键与移动。
 static void testEditRequests()
 {
     out << "\n=== I03 / I06 / I08: edit request reduction ===\n";
@@ -487,7 +487,7 @@ static void testEditRequests()
     }
 }
 
-// I07: preedit never enters the document; commit inserts exactly once; candidate rect follows caret.
+// I07：预编辑不进文档，commit 只插入一次，候选框跟随光标。
 static void testIme()
 {
     out << "\n=== I07: IME preedit and commit ===\n";
@@ -570,7 +570,7 @@ static void testIme()
           QStringLiteral("replacement attributes compute preedit cursor at 5"));
 }
 
-// U05: toolbar character formats and paragraph roles become ordered EditRequest objects.
+// U05：工具栏字符格式与段落角色转成有序的 EditRequest。
 static void testToolbarFormatting()
 {
     out << "\n=== U05: toolbar format requests ===\n";
@@ -697,7 +697,7 @@ static void testToolbarFormatting()
     }
 }
 
-// Stateful wrapper keeps its state and refreshes geometry from a later layout.
+// 有状态封装保持自身状态，并用后来的版面刷新几何。
 static void testController()
 {
     out << "\n=== InteractionController state wrapper ===\n";

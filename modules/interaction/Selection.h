@@ -42,4 +42,4 @@ SelectionState makeSelection(const data::LayoutResult& layout,
 QRectF caretRect(const data::LayoutResult& layout,
                  const data::ContainerId& id, int offset);
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

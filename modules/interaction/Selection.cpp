@@ -42,7 +42,7 @@ QRectF rectFor(const data::TextFragment& f, const QTextLine& line, int a, int b)
     return QRectF(x1, f.rect.top(), qMax<qreal>(0, x2 - x1), f.rect.height());
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 data::TextRange normalizeRange(int a, int b)
 {
@@ -167,4 +167,4 @@ QRectF caretRect(const data::LayoutResult& layout,
     return QRectF(xAt(*best, line, at), best->rect.top(), 1.0, best->rect.height());
 }
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

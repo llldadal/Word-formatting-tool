@@ -20,7 +20,7 @@ const data::ContainerNode* findNode(const data::ContainerNode& root,
     return nullptr;
 }
 
-} // namespace
+} // 匿名命名空间结束
 
 const data::TextContent* findTextContent(const data::DocumentSnapshot& doc,
                                          const data::ContainerId& id)
@@ -75,4 +75,4 @@ int prevBoundary(const data::DocumentSnapshot& doc, const data::ContainerId& id,
     return content ? prevBoundary(content->text, pos) : 0;
 }
 
-} // namespace editor::interaction
+} // 命名空间 editor::interaction 结束

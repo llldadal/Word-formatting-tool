@@ -205,7 +205,7 @@ struct Projector {
     }
 };
 
-} // namespace
+} // 匿名命名空间结束
 
 data::LayoutResult projectLayout(const data::DocumentSnapshot& doc)
 {
@@ -239,4 +239,4 @@ data::LayoutResult projectLayout(const data::DocumentSnapshot& doc)
     return out;
 }
 
-} // namespace editor::slice
+} // 命名空间 editor::slice 结束
