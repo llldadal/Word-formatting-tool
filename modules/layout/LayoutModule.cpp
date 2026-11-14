@@ -138,39 +138,46 @@ static qreal layoutText(
         int lineIndex = 0;
         layout->beginLayout();
 
+        QTextLine pendingLine;
         bool finished = false;
         while (!finished)
         {
             const qreal indent = format.leftIndent
                                  + (lineIndex == 0 ? format.firstLineIndent : 0);
-            const qreal lineWidth = qMax(
-                qreal(0), contentRect.width() - indent - format.rightIndent);
-            const QRectF lineArea(contentRect.left() + indent, lineY,
-                                  lineWidth, format.lineHeight);
+            const qreal lineWidth = contentRect.width() - indent - format.rightIndent;
+            // 缩进用尽整行时，借用未缩进的宽度，避免生成零宽片段。
+            const QRectF lineArea(
+                contentRect.left() + (lineWidth > 0 ? indent : 0), lineY,
+                lineWidth > 0 ? lineWidth : contentRect.width(), format.lineHeight);
             const auto areas = availableTextAreas(lineArea, obstacles);
+            const bool obstructed = areas.size() != 1 || areas.front() != lineArea;
 
-            // 整行被挡住时，向下移一行，原文位置不动。
-            bool advanceRow = areas.empty();
+            const int firstLineOnRow = lineIndex;
             for (const auto& area : areas)
             {
-                auto line = layout->createLine();
-                if (!line.isValid())
+                if (!pendingLine.isValid())
+                    pendingLine = layout->createLine();
+                if (!pendingLine.isValid())
                 {
                     finished = true;
                     break;
                 }
 
-                line.setLineWidth(area.width());
-                line.setPosition(area.topLeft());
+                pendingLine.setLineWidth(area.width());
+                // Qt 允许空行接收超宽文字。绕排时保留原文起点，换个空隙重试。
+                // 整行都可用时允许单个放不下的字形组溢出，保证排版继续。
+                if (obstructed && pendingLine.naturalTextWidth() > area.width())
+                    continue;
+                pendingLine.setPosition(area.topLeft());
 
-                const int start = range.start + line.textStart();
-                const int end = start + line.textLength();
+                const int start = range.start + pendingLine.textStart();
+                const int end = start + pendingLine.textLength();
                 result.textFragments.push_back({
                     node.id, {start, end}, area, layoutIndex, lineIndex
                 });
                 result.layoutBounds = result.layoutBounds.united(area);
                 ++lineIndex;
-                advanceRow = true;
+                pendingLine = QTextLine();
 
                 if (end >= range.end)
                 {
@@ -179,7 +186,7 @@ static qreal layoutText(
                 }
             }
 
-            if (advanceRow)
+            if (!finished || lineIndex != firstLineOnRow)
                 lineY += format.lineHeight;
         }
         layout->endLayout();
