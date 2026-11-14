@@ -21,8 +21,7 @@ CanvasWidget::CanvasWidget(QWidget* parent)
     setMouseTracking(true);
     setCursor(Qt::IBeamCursor);
 
-    m_origin = QPointF(kCanvasMargin, kCanvasMargin);
-    setFixedSize(2 * kCanvasMargin + 760, 2 * kCanvasMargin + 1000);
+    rebuildGeometry();
 
     m_blinkTimer.setInterval(530);
     connect(&m_blinkTimer, &QTimer::timeout, this, [this]() {
@@ -80,20 +79,50 @@ QRectF CanvasWidget::caretRectInWidget() const
     return QRectF();
 }
 
-void CanvasWidget::rebuildGeometry()
+QRectF CanvasWidget::contentAreaInPaper() const
 {
+    const QRectF page = m_result.pageRect.isValid()
+        ? m_result.pageRect
+        : QRectF(0, 0, kFallbackPaperWidth, kFallbackPaperHeight);
+
     QRectF area = m_result.pageRect;
     if (m_result.layoutBounds.isValid()) {
         area = area.united(m_result.layoutBounds);
     }
     if (!area.isValid()) {
-        area = QRectF(0, 0, 760, 1000);
+        area = page;
     }
 
-    m_origin = QPointF(kCanvasMargin, kCanvasMargin);
-    const int width = static_cast<int>(std::ceil(area.width() * m_zoom)) + 2 * kCanvasMargin;
-    const int height = static_cast<int>(std::ceil(area.height() * m_zoom)) + 2 * kCanvasMargin;
-    setFixedSize(qMax(width, 120), qMax(height, 120));
+    const qreal sanity = 4.0 * qMax(page.width(), page.height());
+    if (qAbs(area.left()) > sanity || qAbs(area.top()) > sanity
+        || area.right() > 3.0 * sanity || area.bottom() > 3.0 * sanity) {
+        area = page;
+    }
+    return area;
+}
+
+qreal CanvasWidget::zoomToFitWidth(qreal viewportWidthInWidget) const
+{
+    const qreal available = viewportWidthInWidget - 2 * kCanvasMargin;
+    const qreal areaWidth = contentAreaInPaper().width();
+    if (available <= 0.0 || areaWidth <= 0.0) {
+        return m_zoom;
+    }
+    return available / areaWidth;
+}
+
+void CanvasWidget::rebuildGeometry()
+{
+    const QRectF area = contentAreaInPaper();
+
+    m_origin = QPointF(-area.left() * m_zoom + kCanvasMargin,
+                       -area.top() * m_zoom + kCanvasMargin);
+
+    const int contentWidth = qMax(static_cast<int>(
+        qMin<qreal>(std::ceil(area.width() * m_zoom), kMaxCanvasExtent)), 120);
+    const int contentHeight = qMax(static_cast<int>(
+        qMin<qreal>(std::ceil(area.height() * m_zoom), kMaxCanvasExtent)), 120);
+    setFixedSize(contentWidth + 2 * kCanvasMargin, contentHeight + 2 * kCanvasMargin);
 }
 
 void CanvasWidget::paintEvent(QPaintEvent*)
@@ -132,28 +161,54 @@ void CanvasWidget::paintEvent(QPaintEvent*)
 
 void CanvasWidget::paintContent(QPainter& painter) const
 {
+    Q_ASSERT(m_result.documentRevision == m_snapshot.revision);
+    if (m_result.documentRevision != m_snapshot.revision) {
+        return;
+    }
+
+    const QRectF visibleInPaper = QRectF(widgetToPaper(QPointF(0, 0)),
+                                         widgetToPaper(QPointF(width(), height()))).normalized();
+
     painter.setPen(QColor(0x1a, 0x1a, 0x1a));
     for (const TextFragment& fragment : m_result.textFragments) {
         if (fragment.layoutIndex < 0
-            || fragment.layoutIndex >= static_cast<int>(m_result.textLayouts.size())) {
+            || static_cast<size_t>(fragment.layoutIndex) >= m_result.textLayouts.size()) {
             continue;
         }
         const QTextLayout* layout = m_result.textLayouts[static_cast<size_t>(fragment.layoutIndex)].get();
         if (!layout) {
             continue;
         }
+        if (fragment.lineIndex < 0 || fragment.lineIndex >= layout->lineCount()) {
+            continue;
+        }
+        const QTextLine line = layout->lineAt(fragment.lineIndex);
+        if (!line.isValid()) {
+            continue;
+        }
+        if (!fragment.rect.isValid() || !fragment.rect.intersects(visibleInPaper)) {
+            continue;
+        }
+
         painter.save();
-        painter.translate(fragment.rect.topLeft());
-        layout->draw(&painter, QPointF(0, 0));
+        painter.setClipRect(fragment.rect);
+        line.draw(&painter, fragment.rect.topLeft() - layout->position() - line.position());
         painter.restore();
     }
 
     for (const ImageLayout& imageLayout : m_result.images) {
-        if (!m_snapshot.resources.contains(imageLayout.resourceId)) {
+        if (!imageLayout.rect.isValid() || !imageLayout.rect.intersects(visibleInPaper)) {
             continue;
         }
-        const QImage& image = m_snapshot.resources.value(imageLayout.resourceId);
-        painter.drawImage(imageLayout.rect, image, imageLayout.sourceRect);
+        const auto resource = m_snapshot.resources.constFind(imageLayout.resourceId);
+        if (resource == m_snapshot.resources.constEnd() || resource->isNull()) {
+            continue;
+        }
+        const QRectF source = imageLayout.sourceRect.intersected(QRectF(0.0, 0.0, resource->width(), resource->height()));
+        if (source.isEmpty()) {
+            continue;
+        }
+        painter.drawImage(imageLayout.rect, *resource, source);
     }
 }
 
@@ -250,15 +305,26 @@ void CanvasWidget::paintLayoutBoxes(QPainter& painter) const
 
 void CanvasWidget::paintOverflowMark(QPainter& painter) const
 {
-    if (m_result.layoutBounds.bottom() <= m_result.pageRect.bottom() + 0.5
-        && m_result.layoutBounds.right() <= m_result.pageRect.right() + 0.5) {
+    if (!m_result.layoutBounds.isValid() || !m_result.pageRect.isValid()) {
+        return;
+    }
+
+    constexpr qreal kEpsilon = 0.5;
+    const QRectF& page = m_result.pageRect;
+    const QRectF& bounds = m_result.layoutBounds;
+
+    const bool overflows = bounds.bottom() > page.bottom() + kEpsilon
+        || bounds.right() > page.right() + kEpsilon
+        || bounds.left() < page.left() - kEpsilon
+        || bounds.top() < page.top() - kEpsilon;
+    if (!overflows) {
         return;
     }
 
     painter.save();
     painter.setPen(QPen(QColor(0xe0, 0x4b, 0x3d, 220), qMax(1.2 / m_zoom, 0.7), Qt::DashLine));
     painter.setBrush(Qt::NoBrush);
-    painter.drawRect(m_result.pageRect);
+    painter.drawRect(page);
     painter.restore();
 }
 

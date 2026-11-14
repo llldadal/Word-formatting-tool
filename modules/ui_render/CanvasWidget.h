@@ -1,4 +1,4 @@
-#pragma once
+ #pragma once
 
 #include "DocumentSnapshot.h"
 #include "LayoutResult.h"
@@ -29,6 +29,8 @@ public:
     void setShowLayoutBoxes(bool show);
     bool showLayoutBoxes() const { return m_showBoxes; }
 
+    qreal zoomToFitWidth(qreal viewportWidthInWidget) const;
+
     QPointF paperToWidget(const QPointF& paperPoint) const;
     QPointF widgetToPaper(const QPointF& widgetPoint) const;
     QRectF caretRectInWidget() const;
@@ -49,6 +51,7 @@ protected:
 
 private:
     void rebuildGeometry();
+    QRectF contentAreaInPaper() const;
     void paintContent(QPainter& painter) const;
     void paintSelectionAndCaret(QPainter& painter) const;
     void paintLayoutBoxes(QPainter& painter) const;
@@ -68,4 +71,7 @@ private:
     bool m_caretVisible = true;
 
     static constexpr int kCanvasMargin = 36;
+    static constexpr qreal kFallbackPaperWidth = 760;
+    static constexpr qreal kFallbackPaperHeight = 1000;
+    static constexpr int kMaxCanvasExtent = 32767;
 };

@@ -20,7 +20,6 @@ MainWindow::MainWindow(QWidget* parent)
     ui->setupUi(this);
     buildToolBar();
 
-    // 1. 初始化状态栏
     m_pointerLabel = new QLabel(QStringLiteral("纸张坐标：-"), this);
     m_caretLabel = new QLabel(QStringLiteral("光标：未定位"), this);
     m_overflowLabel = new QLabel(QStringLiteral("溢出：无"), this);
@@ -32,7 +31,6 @@ MainWindow::MainWindow(QWidget* parent)
     statusBar()->addPermanentWidget(m_zoomLabel);
     statusBar()->addPermanentWidget(m_resultLabel);
 
-    // 2. 连接 UI 信号
     connect(ui->actionNew, &QAction::triggered, this, &MainWindow::newDocument);
     connect(ui->actionExportWord, &QAction::triggered, this, &MainWindow::exportWord);
     connect(ui->actionQuit, &QAction::triggered, this, &QWidget::close);
@@ -42,11 +40,17 @@ MainWindow::MainWindow(QWidget* parent)
     connect(ui->actionZoomIn, &QAction::triggered, this, [this]() { setZoom(ui->canvas->zoom() * 1.1); });
     connect(ui->actionZoomOut, &QAction::triggered, this, [this]() { setZoom(ui->canvas->zoom() / 1.1); });
     connect(ui->actionZoomActual, &QAction::triggered, this, [this]() { setZoom(1.0); });
+
+    connect(ui->actionFitWidth, &QAction::triggered, this, [this]() {
+        setZoom(ui->canvas->zoomToFitWidth(ui->scrollArea->viewport()->width()));
+    });
+
+    connect(ui->actionShowBoxes, &QAction::toggled, ui->canvas, &CanvasWidget::setShowLayoutBoxes);
     connect(m_fontCombo, &QFontComboBox::currentFontChanged, this, &MainWindow::applyFontFamily);
     connect(m_styleCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::applyParagraphStyle);
     connect(ui->canvas, &CanvasWidget::pointerMoved, this, &MainWindow::onPointerMoved);
 
-    // 3. 留空壳，防止程序崩溃，等待主程序注入真实数据
+    //留空壳，防止程序崩溃，等待主程序注入真实数据
     m_snapshot.page.size = QSizeF(760, 1000);
 
     m_layoutResult.pageRect = QRectF(0, 0, 760, 1000);
@@ -126,12 +130,23 @@ void MainWindow::setZoom(qreal zoom)
 void MainWindow::updateStatus()
 {
     m_zoomLabel->setText(QStringLiteral("缩放：%1%").arg(qRound(ui->canvas->zoom() * 100.0)));
-    const qreal downward = m_layoutResult.layoutBounds.bottom() - m_layoutResult.pageRect.bottom();
-    const qreal rightward = m_layoutResult.layoutBounds.right() - m_layoutResult.pageRect.right();
-    if (downward > 0.5 || rightward > 0.5) {
-        QStringList parts;
-        if (downward > 0.5) parts << QStringLiteral("向下 %1 px").arg(qRound(downward));
-        if (rightward > 0.5) parts << QStringLiteral("向右 %1 px").arg(qRound(rightward));
+    const QRectF& page = m_layoutResult.pageRect;
+    const QRectF& bounds = m_layoutResult.layoutBounds;
+
+    QStringList parts;
+    if (page.isValid() && bounds.isValid()) {
+        const auto append = [&parts](qreal amount, const QString& direction) {
+            if (amount > 0.5) {
+                parts << QStringLiteral("%1 %2 px").arg(direction).arg(qRound(amount));
+            }
+        };
+        append(bounds.bottom() - page.bottom(), QStringLiteral("向下"));
+        append(bounds.right() - page.right(), QStringLiteral("向右"));
+        append(page.left() - bounds.left(), QStringLiteral("向左"));
+        append(page.top() - bounds.top(), QStringLiteral("向上"));
+    }
+
+    if (!parts.isEmpty()) {
         m_overflowLabel->setText(QStringLiteral("溢出：") + parts.join(QStringLiteral("，")));
         m_overflowLabel->setStyleSheet(QStringLiteral("color:#c0392b;"));
     } else {
