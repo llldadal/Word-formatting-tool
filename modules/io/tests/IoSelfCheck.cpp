@@ -10,9 +10,14 @@
 #include <QFile>
 #include <QGuiApplication>
 #include <QImage>
+#include <QMarginsF>
+#include <QRectF>
 #include <QTemporaryDir>
+#include <QXmlStreamReader>
 
 #include <cstdio>
+
+namespace ed = editor::data;
 
 using editor::io::buildDocx;
 using editor::io::exportDocx;
@@ -338,6 +343,161 @@ int main(int argc, char** argv)
             if (exportDocx(fixture.document, layout, path).ok()) ++written;
         }
         check(written == 9, QString("wrote %1/9 sample DOCX files to io-export").arg(written));
+    }
+
+    // ---- 回归：本轮修掉的导出问题，逐条用真实 DOCX 内容验证 ----
+    {
+        const LayoutCase f01 = makeLayoutCase(QStringLiteral("01"));
+        const auto l01 = makeStandardLayout(QStringLiteral("01"));
+
+        // 页边距四个方向相互独立。
+        ed::DocumentSnapshot marginsDoc = f01.document;
+        marginsDoc.page.margins.setTop(10);
+        marginsDoc.page.margins.setRight(30);
+        marginsDoc.page.margins.setBottom(20);
+        marginsDoc.page.margins.setLeft(40);
+        const DocxBuildResult rm = buildDocx(marginsDoc, l01);
+        QByteArray marginsBytes, stylesBytes;
+        zipEntry(rm.package, QStringLiteral("word/document.xml"), &marginsBytes);
+        zipEntry(rm.package, QStringLiteral("word/styles.xml"), &stylesBytes);
+        const QString marginsXml = QString::fromUtf8(marginsBytes);
+        check(rm.result.ok()
+                  && marginsXml.contains(QStringLiteral(
+                         "w:top=\"150\" w:right=\"450\" w:bottom=\"300\" w:left=\"600\"")),
+              "page margins map to four independent values");
+        check(QString::fromUtf8(stylesBytes).contains(
+                  QStringLiteral("<w:pPr><w:outlineLvl w:val=\"0\"/></w:pPr>")),
+              "outlineLvl lives inside the style's w:pPr");
+
+        // 负首行缩进用 w:hanging，lineHeight=0 不生成 w:line="0"。
+        ed::DocumentSnapshot indentDoc = f01.document;
+        for (auto& node : indentDoc.root.children) {
+            if (node.type == ed::ContainerType::Text && !node.text.paragraphs.empty()) {
+                node.text.paragraphs[0].format.firstLineIndent = -20;
+                node.text.paragraphs[0].format.lineHeight = 0;
+                node.text.paragraphs[0].format.spaceBefore = 10;
+                break;
+            }
+        }
+        const DocxBuildResult ri = buildDocx(indentDoc, l01);
+        QByteArray indentBytes;
+        zipEntry(ri.package, QStringLiteral("word/document.xml"), &indentBytes);
+        const QString indentXml = QString::fromUtf8(indentBytes);
+        check(indentXml.contains(QStringLiteral("w:hanging=\"300\"")),
+              "negative first-line indent becomes w:hanging");
+        check(!indentXml.contains(QStringLiteral("w:line=\"0\"")),
+              "zero line height does not emit w:line=0");
+
+        // 标题级别超出 1..9 时收敛到已定义的样式。
+        ed::DocumentSnapshot headingDoc = f01.document;
+        for (auto& node : headingDoc.root.children) {
+            if (node.type == ed::ContainerType::Text && !node.text.paragraphs.empty()) {
+                node.text.paragraphs[0].role = ed::ParagraphRole::Heading;
+                node.text.paragraphs[0].headingLevel = 12;
+                break;
+            }
+        }
+        const DocxBuildResult rh = buildDocx(headingDoc, l01);
+        QByteArray headingBytes;
+        zipEntry(rh.package, QStringLiteral("word/document.xml"), &headingBytes);
+        const QString headingXml = QString::fromUtf8(headingBytes);
+        check(headingXml.contains(QStringLiteral("w:val=\"Heading9\""))
+                  && !headingXml.contains(QStringLiteral("Heading12")),
+              "out-of-range heading level clamps to Heading9");
+
+        // CT_RPr 子元素顺序：color / sz 都要排在 u 前面。
+        const LayoutCase f07 = makeLayoutCase(QStringLiteral("07"));
+        const auto l07 = makeStandardLayout(QStringLiteral("07"));
+        const DocxBuildResult r07 = buildDocx(f07.document, l07);
+        QByteArray rprBytes;
+        zipEntry(r07.package, QStringLiteral("word/document.xml"), &rprBytes);
+        const QString rprXml = QString::fromUtf8(rprBytes);
+        check(rprXml.indexOf(QStringLiteral("<w:color ")) >= 0
+                  && rprXml.indexOf(QStringLiteral("<w:u ")) > rprXml.indexOf(QStringLiteral("<w:color ")),
+              "CT_RPr order: w:color before w:u");
+        check(rprXml.indexOf(QStringLiteral("<w:sz ")) < rprXml.indexOf(QStringLiteral("<w:u ")),
+              "CT_RPr order: w:sz before w:u");
+
+        // 浮动图片：effectExtent 不再混用绕排距离。
+        const LayoutCase f02 = makeLayoutCase(QStringLiteral("02"));
+        const auto l02 = makeStandardLayout(QStringLiteral("02"));
+        const DocxBuildResult r02 = buildDocx(f02.document, l02);
+        QByteArray anchorBytes;
+        zipEntry(r02.package, QStringLiteral("word/document.xml"), &anchorBytes);
+        check(QString::fromUtf8(anchorBytes).contains(
+                  QStringLiteral("<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>")),
+              "effectExtent stays zero when the shape has no visual effect");
+
+        // 行内图片：段落行高覆盖 + 裁剪区域真正写进 a:srcRect。
+        const LayoutCase f04 = makeLayoutCase(QStringLiteral("04"));
+        const auto l04 = makeStandardLayout(QStringLiteral("04"));
+        const DocxBuildResult r04 = buildDocx(f04.document, l04);
+        QByteArray inlineBytes;
+        zipEntry(r04.package, QStringLiteral("word/document.xml"), &inlineBytes);
+        const QString inlineXml = QString::fromUtf8(inlineBytes);
+        check(inlineXml.contains(QStringLiteral("w:lineRule=\"atLeast\"")),
+              "image paragraph overrides the fixed line height with atLeast");
+        check(!inlineXml.contains(QStringLiteral("<a:srcRect")),
+              "full-image sourceRect does not emit a redundant a:srcRect");
+
+        auto cropped = l04;
+        cropped.images[0].sourceRect = QRectF(100, 50, 300, 200);
+        const DocxBuildResult rc = buildDocx(f04.document, cropped);
+        QByteArray cropBytes;
+        zipEntry(rc.package, QStringLiteral("word/document.xml"), &cropBytes);
+        check(QString::fromUtf8(cropBytes).contains(QStringLiteral(
+                  "<a:srcRect l=\"15625\" t=\"12500\" r=\"37500\" b=\"37500\"/>")),
+              "cropped sourceRect becomes a:srcRect percentages");
+
+        // 少了 ImageLayout 必须报错，不能静默输出空段落还返回 Ok。
+        auto missing = l04;
+        missing.images.clear();
+        const DocxBuildResult rmiss = buildDocx(f04.document, missing);
+        check(rmiss.result.status == DocxExportStatus::IoError,
+              "missing ImageLayout is rejected instead of silently exporting an empty paragraph");
+
+        // 非法字符过滤后，document.xml 仍然是合法 XML。
+        ed::DocumentSnapshot badDoc = f01.document;
+        for (auto& node : badDoc.root.children) {
+            if (node.type != ed::ContainerType::Text || node.text.paragraphs.empty())
+                continue;
+            QString bad = QStringLiteral("A");
+            bad.append(QChar(0x01));
+            bad.append(QChar(0xD800)); // 孤立高代理项。
+            bad.append(QStringLiteral("BC"));
+            node.text.text = bad;
+            node.text.paragraphs.erase(node.text.paragraphs.begin() + 1,
+                                       node.text.paragraphs.end());
+            node.text.paragraphs[0].range = {0, static_cast<int>(bad.size())};
+            node.text.formatSpans.clear();
+            break;
+        }
+        const DocxBuildResult rbad = buildDocx(badDoc, l01);
+        QByteArray badBytes;
+        zipEntry(rbad.package, QStringLiteral("word/document.xml"), &badBytes);
+        QXmlStreamReader reader(QString::fromUtf8(badBytes));
+        while (!reader.atEnd())
+            reader.readNext();
+        check(!reader.hasError() && !QString::fromUtf8(badBytes).contains(QChar(0x01)),
+              "illegal XML characters are stripped and the part stays well-formed");
+
+        // 所有真实样例的 document.xml 都能被 XML 解析器完整读完。
+        for (const char* id : {"01", "02", "03", "04", "06", "07", "09", "10", "11"}) {
+            const LayoutCase fx = makeLayoutCase(QString::fromLatin1(id));
+            const auto ly = makeStandardLayout(QString::fromLatin1(id));
+            const DocxBuildResult r = buildDocx(fx.document, ly);
+            QByteArray part;
+            bool ok = r.result.ok()
+                   && zipEntry(r.package, QStringLiteral("word/document.xml"), &part);
+            if (ok) {
+                QXmlStreamReader xmlReader(QString::fromUtf8(part));
+                while (!xmlReader.atEnd())
+                    xmlReader.readNext();
+                ok = !xmlReader.hasError();
+            }
+            check(ok, QString("case %1 document.xml is well-formed XML")
+                          .arg(QLatin1String(id)));
+        }
     }
 
     std::printf("===== IO self-check: %s =====\n",

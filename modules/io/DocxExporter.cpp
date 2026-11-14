@@ -35,23 +35,73 @@ using data::TextStyleOverride;
 // ---------- 基础换算与转义 ----------
 
 // 1 文档逻辑像素 = 15 twip = 9525 EMU；字号 pt 用半点。
-int toTwips(qreal px) { return qRound(px * 15.0); }
-qint64 toEmu(qreal px) { return qRound64(px * 9525.0); }
-int toHalfPoints(qreal pt) { return qRound(pt * 2.0); }
+// 所有换算都先挡住 NaN 和越界数值，避免把非法属性值写进 XML。
+int toTwips(qreal px)
+{
+    const qreal v = qIsFinite(px) ? qBound<qreal>(-1000000.0, px, 1000000.0) : 0.0;
+    return qRound(v * 15.0);
+}
+qint64 toEmu(qreal px)
+{
+    const qreal v = qIsFinite(px) ? qBound<qreal>(0.0, px, 10000000.0) : 0.0;
+    return qRound64(v * 9525.0);
+}
+int toHalfPoints(qreal pt)
+{
+    // w:sz 是正整数（半点）。负字号、0 字号或极大字号都会让 Word 判为损坏。
+    const qreal v = qIsFinite(pt) ? qBound<qreal>(0.5, pt, 1638.0) : 12.0;
+    return qRound(v * 2.0);
+}
 qreal toPoints(qreal px) { return px * 0.75; } // VML 回退分支使用磅。
 
+// XML 1.0 允许的码点：#x9 #xA #xD、#x20-#xD7FF、#xE000-#xFFFD、#x10000-#x10FFFF。
+bool isXmlChar(unsigned int u)
+{
+    return u == 0x9 || u == 0xa || u == 0xd
+        || (u >= 0x20 && u <= 0xd7ff)
+        || (u >= 0xe000 && u <= 0xfffd)
+        || (u >= 0x10000 && u <= 0x10ffff);
+}
+
+// 转义之外还要过滤 XML 非法字符：C0 控制符、U+FFFE/U+FFFF、孤立代理项。
+// 这类字符一旦写进 document.xml，Word 会直接报「文件已损坏」。
 QString escapeXml(const QString& text)
 {
     QString out;
     out.reserve(text.size());
-    for (const QChar c : text) {
-        switch (c.unicode()) {
+    for (int i = 0; i < text.size(); ++i) {
+        const unsigned int u = static_cast<unsigned int>(text.at(i).unicode());
+        if (u >= 0xd800 && u <= 0xdbff) {
+            // 高代理项只有紧跟低代理项才构成一个合法码点。
+            if (i + 1 < text.size()) {
+                const unsigned int low = static_cast<unsigned int>(text.at(i + 1).unicode());
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    const unsigned int codePoint =
+                        0x10000u + ((u - 0xd800u) << 10) + (low - 0xdc00u);
+                    if (isXmlChar(codePoint)) {
+                        out.append(text.at(i));
+                        out.append(text.at(++i));
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+        if (u >= 0xdc00 && u <= 0xdfff)
+            continue; // 孤立的低代理项。
+        if (!isXmlChar(u))
+            continue;
+
+        switch (u) {
+        case 0x9: out += QStringLiteral("&#x9;"); break;
+        case 0xa: out += QStringLiteral("&#xA;"); break;
+        case 0xd: out += QStringLiteral("&#xD;"); break;
         case u'&': out += QStringLiteral("&amp;"); break;
         case u'<': out += QStringLiteral("&lt;"); break;
         case u'>': out += QStringLiteral("&gt;"); break;
         case u'"': out += QStringLiteral("&quot;"); break;
         case u'\'': out += QStringLiteral("&apos;"); break;
-        default: out += c;
+        default: out.append(text.at(i));
         }
     }
     return out;
@@ -155,6 +205,8 @@ struct ParaOut {
 
 QString runXml(const QString& text, const TextStyle& style)
 {
+    // CT_RPr 的子元素有固定顺序：rFonts → b → i → color → sz → szCs → u。
+    // 顺序写错时 Word 会忽略整段 rPr，表现为字体、字号、下划线全部失效。
     QString rpr;
     if (!style.fontFamily.isEmpty()) {
         const QString f = escapeXml(style.fontFamily);
@@ -162,10 +214,10 @@ QString runXml(const QString& text, const TextStyle& style)
     }
     if (style.bold) rpr += QStringLiteral("<w:b/>");
     if (style.italic) rpr += QStringLiteral("<w:i/>");
-    if (style.underline) rpr += QStringLiteral("<w:u w:val=\"single\"/>");
     rpr += QStringLiteral("<w:color w:val=\"%1\"/>").arg(colorHex(style.color));
     const int sz = toHalfPoints(style.fontSizePt);
     rpr += QStringLiteral("<w:sz w:val=\"%1\"/><w:szCs w:val=\"%1\"/>").arg(sz);
+    if (style.underline) rpr += QStringLiteral("<w:u w:val=\"single\"/>");
     return QStringLiteral("<w:r><w:rPr>%1</w:rPr><w:t xml:space=\"preserve\">%2</w:t></w:r>")
         .arg(rpr, escapeXml(text));
 }
@@ -183,8 +235,11 @@ QString jcValue(ParagraphAlignment alignment)
 QString pStyleValue(const ParagraphInfo& info)
 {
     if (info.role == ParagraphRole::Title) return QStringLiteral("Title");
-    if (info.role == ParagraphRole::Heading)
-        return QStringLiteral("Heading%1").arg(info.headingLevel);
+    if (info.role == ParagraphRole::Heading) {
+        // styles.xml 只定义 Heading1..Heading9。级别写成 12 之类的值会引用
+        // 不存在的样式，Word 会悄悄回退成 Normal，标题层级就丢了。
+        return QStringLiteral("Heading%1").arg(qBound(1, info.headingLevel, 9));
+    }
     return QString();
 }
 
@@ -200,28 +255,52 @@ QString paragraphXml(const ContainerNode& node, const ParagraphInfo* info,
     QString pPr;
     if (!fmt.pStyle.isEmpty())
         pPr += QStringLiteral("<w:pStyle w:val=\"%1\"/>").arg(fmt.pStyle);
-    if (fmt.before || fmt.after || fmt.line)
-        pPr += QStringLiteral("<w:spacing w:before=\"%1\" w:after=\"%2\" w:line=\"%3\" w:lineRule=\"exact\"/>")
-                   .arg(fmt.before).arg(fmt.after).arg(fmt.line);
-    if (fmt.left || fmt.right || fmt.firstLine)
-        pPr += QStringLiteral("<w:ind w:left=\"%1\" w:right=\"%2\" w:firstLine=\"%3\"/>")
-                   .arg(fmt.left).arg(fmt.right).arg(fmt.firstLine);
+    // line 为 0 表示「不写行距」。旧写法在只有 before/after 时也会生成
+    // w:line="0" lineRule="exact"，Word 会把这一行压成 0 高。
+    if (fmt.before || fmt.after || fmt.line > 0) {
+        // 段前段后间距不接受负值，越界输入一律按 0 处理。
+        QString spacing = QStringLiteral("<w:spacing w:before=\"%1\" w:after=\"%2\"")
+                              .arg(qMax(0, fmt.before)).arg(qMax(0, fmt.after));
+        if (fmt.line > 0)
+            spacing += QStringLiteral(" w:line=\"%1\" w:lineRule=\"exact\"").arg(fmt.line);
+        pPr += spacing + QStringLiteral("/>");
+    }
+    if (fmt.left || fmt.right || fmt.firstLine) {
+        // 左右缩进同样不接受负值；负的首行缩进单独映射成悬挂缩进。
+        QString ind = QStringLiteral("<w:ind w:left=\"%1\" w:right=\"%2\"")
+                          .arg(qMax(0, fmt.left)).arg(qMax(0, fmt.right));
+        // 负的首行缩进是悬挂缩进，OOXML 用 w:hanging 表达，不能用负的
+        // w:firstLine（Word 不接受，会丢掉整段缩进设置）。
+        if (fmt.firstLine > 0)
+            ind += QStringLiteral(" w:firstLine=\"%1\"").arg(fmt.firstLine);
+        else if (fmt.firstLine < 0)
+            ind += QStringLiteral(" w:hanging=\"%1\"").arg(-fmt.firstLine);
+        pPr += ind + QStringLiteral("/>");
+    }
     if (!fmt.jc.isEmpty())
         pPr += QStringLiteral("<w:jc w:val=\"%1\"/>").arg(fmt.jc);
 
     // 以段落范围和格式区间边界切分 run，避免同一 run 内格式变化。
-    std::vector<int> bounds{pStart, pEnd};
+    const int textLen = static_cast<int>(text.size());
+    const int lo = qBound(0, pStart, textLen);
+    const int hi = qBound(lo, pEnd, textLen);
+    std::vector<int> bounds{lo, hi};
     for (const auto& span : node.text.formatSpans) {
-        const int s = std::max(span.range.start, pStart);
-        const int e = std::min(span.range.end, pEnd);
+        const int s = qBound(lo, span.range.start, hi);
+        const int e = qBound(lo, span.range.end, hi);
         if (s < e) { bounds.push_back(s); bounds.push_back(e); }
     }
-    // 不让边界落在 UTF-16 代理对中间。
-    for (size_t i = 1; i + 1 < bounds.size(); ++i) {
-        if (bounds[i] > 0 && bounds[i] < text.size()
-            && text.at(bounds[i] - 1).isHighSurrogate()
-            && text.at(bounds[i]).isLowSurrogate()) {
-            bounds[i] += 1;
+    // 每个边界都不能落在 UTF-16 代理对中间，包括段落首尾两个边界。
+    // 旧循环跳过最后一个边界，且只会向后加 1，段落末尾恰好切在 emoji
+    // 中间时会把低代理项单独导出，生成非法 XML。
+    for (int& b : bounds) {
+        if (b > 0 && b < textLen
+            && text.at(b - 1).isHighSurrogate()
+            && text.at(b).isLowSurrogate()) {
+            if (b + 1 <= hi)
+                b += 1;
+            else if (b - 1 >= lo)
+                b -= 1;
         }
     }
     std::sort(bounds.begin(), bounds.end());
@@ -272,7 +351,13 @@ QString textBoxParagraphsXml(const ContainerNode& node)
     return xml;
 }
 
-QString anchorOpenXml(const FloatingPlan& plan, const QMarginsF& margin)
+// drawRect 是真正画出来的内容区：图片用 ImageLayout::rect（已扣 padding），
+// 文本框用 ContainerLayout::rect（框本身就是内容区）。
+// effectExtent 描述阴影、发光等视觉特效超出边框的范围，和 dist*（正文绕排
+// 距离）不是一回事。本模块不画特效，一律写 0；旧代码把 margin 重复填进来，
+// Word 会误以为图片有特效外扩，把绕排区域算大一圈。
+QString anchorOpenXml(const FloatingPlan& plan, const QMarginsF& margin,
+                      const QRectF& drawRect)
 {
     return QStringLiteral(
                "<wp:anchor distT=\"%1\" distB=\"%2\" distL=\"%3\" distR=\"%4\" "
@@ -288,35 +373,72 @@ QString anchorOpenXml(const FloatingPlan& plan, const QMarginsF& margin)
                "<wp:positionH relativeFrom=\"page\"><wp:posOffset>%1</wp:posOffset></wp:positionH>"
                "<wp:positionV relativeFrom=\"page\"><wp:posOffset>%2</wp:posOffset></wp:positionV>"
                "<wp:extent cx=\"%3\" cy=\"%4\"/>"
-               "<wp:effectExtent l=\"%5\" t=\"%6\" r=\"%7\" b=\"%8\"/>"
+               "<wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>"
                "<wp:wrapSquare wrapText=\"bothSides\"/>"
-               "<wp:docPr id=\"%9\" name=\"%10\"/>")
-              .arg(toEmu(plan.box.rect.left()))
-              .arg(toEmu(plan.box.rect.top()))
-              .arg(toEmu(plan.box.rect.width()))
-              .arg(toEmu(plan.box.rect.height()))
-              .arg(toEmu(margin.left()))
-              .arg(toEmu(margin.top()))
-              .arg(toEmu(margin.right()))
-              .arg(toEmu(margin.bottom()))
+               "<wp:docPr id=\"%5\" name=\"%6\"/>")
+              .arg(toEmu(drawRect.left()))
+              .arg(toEmu(drawRect.top()))
+              .arg(toEmu(drawRect.width()))
+              .arg(toEmu(drawRect.height()))
               .arg(plan.docPrId)
               .arg(escapeXml(plan.node->id));
 }
 
-QString imageAnchorRunXml(const FloatingPlan& plan)
+// 生成 pic:blipFill。ImageLayout::sourceRect 是原图像素坐标的裁剪区域，
+// OOXML 的 a:srcRect 用「千分之一百分比」表达四边各裁掉多少，100000 表示 100%。
+// 旧代码完全没读 sourceRect，排版组裁过的图导出后会变回整张原图。
+QString blipFillXml(const ImageLayout& image, const QString& relId,
+                    const data::DocumentSnapshot& doc)
+{
+    QString xml = QStringLiteral("<pic:blipFill><a:blip r:embed=\"%1\"/>").arg(relId);
+    const auto it = doc.resources.constFind(image.resourceId);
+    const QRectF src = image.sourceRect;
+    if (it != doc.resources.constEnd() && !it->isNull()
+        && src.isValid() && src.width() > 0 && src.height() > 0) {
+        const qreal w = static_cast<qreal>(it->width());
+        const qreal h = static_cast<qreal>(it->height());
+        if (w > 0 && h > 0) {
+            // QRectF::right()/bottom() 因历史原因会减 1，这里直接用 x+width。
+            const int l = qRound(qBound<qreal>(0, src.left() / w * 100000.0, 100000.0));
+            const int t = qRound(qBound<qreal>(0, src.top() / h * 100000.0, 100000.0));
+            const int r = qRound(qBound<qreal>(0, (w - src.left() - src.width()) / w * 100000.0,
+                                                100000.0 - l));
+            const int b = qRound(qBound<qreal>(0, (h - src.top() - src.height()) / h * 100000.0,
+                                                100000.0 - t));
+            if (l || t || r || b)
+                xml += QStringLiteral("<a:srcRect l=\"%1\" t=\"%2\" r=\"%3\" b=\"%4\"/>")
+                          .arg(l).arg(t).arg(r).arg(b);
+        }
+    }
+    xml += QStringLiteral("<a:stretch><a:fillRect/></a:stretch></pic:blipFill>");
+    return xml;
+}
+
+QString imageAnchorRunXml(const FloatingPlan& plan, const LayoutResult& layout,
+                          const data::DocumentSnapshot& doc)
 {
     const QMarginsF margin = plan.node->geometry.margin;
-    return QStringLiteral("<w:r><w:drawing>") + anchorOpenXml(plan, margin)
+    const ImageLayout* image = findImage(layout, plan.node->id);
+    // 图片画的是 ImageLayout::rect（内容区），不是容器框 rect；后者含 padding，
+    // 用它当锚点位置和尺寸时，图片会被放大并偏移一个 padding。
+    const QRectF draw = image ? image->rect : plan.box.rect;
+    ImageLayout effective;
+    effective.containerId = plan.node->id;
+    effective.resourceId = image ? image->resourceId : plan.node->image.resourceId;
+    effective.rect = draw;
+    if (image)
+        effective.sourceRect = image->sourceRect;
+
+    return QStringLiteral("<w:r><w:drawing>") + anchorOpenXml(plan, margin, draw)
          + QStringLiteral("<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">")
          + QStringLiteral("<pic:pic><pic:nvPicPr><pic:cNvPr id=\"%1\" name=\"%2\"/><pic:cNvPicPr/></pic:nvPicPr>")
                .arg(plan.docPrId)
                .arg(escapeXml(plan.node->id))
-         + QStringLiteral("<pic:blipFill><a:blip r:embed=\"%1\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>")
-               .arg(plan.relId)
+         + blipFillXml(effective, plan.relId, doc)
          + QStringLiteral("<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%1\" cy=\"%2\"/></a:xfrm>"
                           "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>")
-               .arg(toEmu(plan.box.rect.width()))
-               .arg(toEmu(plan.box.rect.height()))
+               .arg(toEmu(draw.width()))
+               .arg(toEmu(draw.height()))
          + QStringLiteral("</pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing></w:r>");
 }
 
@@ -327,7 +449,7 @@ QString textBoxAnchorRunXml(const FloatingPlan& plan, AnchorContext* ctx)
     const QString paragraphs = textBoxParagraphsXml(*plan.node);
 
     // Word 2010+ 读取 wps 分支；旧版本读取 VML 回退分支，两边内容一致。
-    QString choice = QStringLiteral("<w:drawing>") + anchorOpenXml(plan, margin)
+    QString choice = QStringLiteral("<w:drawing>") + anchorOpenXml(plan, margin, plan.box.rect)
         + QStringLiteral("<a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\">")
         + QStringLiteral("<wps:wsp><wps:cNvSpPr txBox=\"1\"/>")
         + QStringLiteral("<wps:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%1\" cy=\"%2\"/></a:xfrm>"
@@ -381,7 +503,8 @@ QString textBoxAnchorRunXml(const FloatingPlan& plan, AnchorContext* ctx)
 }
 
 QString inlineImageRunXml(const ContainerNode& node, const ImageLayout& image,
-                          const QString& relId, int docPrId)
+                          const QString& relId, int docPrId,
+                          const data::DocumentSnapshot& doc)
 {
     return QStringLiteral("<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\">")
          + QStringLiteral("<wp:extent cx=\"%1\" cy=\"%2\"/>")
@@ -391,8 +514,7 @@ QString inlineImageRunXml(const ContainerNode& node, const ImageLayout& image,
          + QStringLiteral("<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">")
          + QStringLiteral("<pic:pic><pic:nvPicPr><pic:cNvPr id=\"%1\" name=\"%2\"/><pic:cNvPicPr/></pic:nvPicPr>")
                .arg(docPrId).arg(escapeXml(node.id))
-         + QStringLiteral("<pic:blipFill><a:blip r:embed=\"%1\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>")
-               .arg(relId)
+         + blipFillXml(image, relId, doc)
          + QStringLiteral("<pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"%1\" cy=\"%2\"/></a:xfrm>"
                           "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>")
                .arg(toEmu(image.rect.width()))
@@ -414,6 +536,7 @@ struct BlockResult {
 };
 
 struct WriterState {
+    const data::DocumentSnapshot* doc = nullptr; // 取原图尺寸，用于 a:srcRect。
     const LayoutResult* layout = nullptr;
     const QHash<ContainerId, FloatingPlan>* floats = nullptr;
     const QHash<ContainerId, QString>* relIdByContainer = nullptr;
@@ -430,7 +553,7 @@ BlockResult writeTextContainer(const ContainerNode& node, const FlowCtx& ctx,
         const auto it = state->floats->constFind(child.id);
         if (it == state->floats->constEnd()) continue;
         if (child.type == data::ContainerType::Image)
-            anchorRuns += imageAnchorRunXml(it.value());
+            anchorRuns += imageAnchorRunXml(it.value(), *state->layout, *state->doc);
         else
             anchorRuns += textBoxAnchorRunXml(it.value(), &state->anchorCtx);
     }
@@ -477,7 +600,7 @@ BlockResult writeImageBlock(const ContainerNode& node, const FlowCtx& ctx,
 {
     const ImageLayout* image = findImage(*state->layout, node.id);
     if (!image)
-        return {QStringLiteral("<w:p></w:p>"), 0}; // 校验阶段已拦截，这里不发生。
+        return {QStringLiteral("<w:p></w:p>"), 0}; // validateInput 已拒绝缺图的情况。
     const auto relIt = state->relIdByContainer->constFind(node.id);
     const QString relId = relIt != state->relIdByContainer->constEnd()
                               ? relIt.value() : QString();
@@ -485,12 +608,17 @@ BlockResult writeImageBlock(const ContainerNode& node, const FlowCtx& ctx,
     const int lead = ctx.pendingBefore
                    + toTwips(node.geometry.margin.top() + node.geometry.padding.top());
     const int tail = toTwips(node.geometry.margin.bottom() + node.geometry.padding.bottom());
-    QString pPr;
-    if (lead || tail)
-        pPr = QStringLiteral("<w:pPr><w:spacing w:before=\"%1\" w:after=\"%2\"/></w:pPr>")
-                  .arg(lead).arg(tail);
+    // styles.xml 的 docDefaults 给每段设了 390 twip（26px）固定行高。
+    // 图片段落不写 w:line 时，高于 26px 的图片会被裁掉下半截。
+    // 用 atLeast 覆盖，Word 至少给足图片所需的行高。
+    const int line = qMax(390, toTwips(image->rect.height()));
+    const QString pPr = QStringLiteral(
+                            "<w:pPr><w:spacing w:before=\"%1\" w:after=\"%2\" "
+                            "w:line=\"%3\" w:lineRule=\"atLeast\"/></w:pPr>")
+                            .arg(qMax(0, lead)).arg(qMax(0, tail)).arg(line);
     const QString xml = QStringLiteral("<w:p>%1%2</w:p>")
-                            .arg(pPr, inlineImageRunXml(node, *image, relId, docPrId));
+                            .arg(pPr, inlineImageRunXml(node, *image, relId, docPrId,
+                                                        *state->doc));
     return {xml, tail};
 }
 
@@ -601,10 +729,13 @@ QString stylesXml()
         "<w:name w:val=\"Title\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>"
         "</w:style>");
     for (int level = 1; level <= 9; ++level) {
+        // outlineLvl 属于 CT_PPr，不能直接挂在 w:style 下面。放进 w:pPr
+        // 才能让大纲级别生效，Word 的导航窗格和目录也才能认出标题层级。
         xml += QStringLiteral(
                    "<w:style w:type=\"paragraph\" w:styleId=\"Heading%1\">"
                    "<w:name w:val=\"heading %1\"/><w:basedOn w:val=\"Normal\"/>"
-                   "<w:next w:val=\"Normal\"/><w:qFormat/><w:outlineLvl w:val=\"%2\"/>"
+                   "<w:next w:val=\"Normal\"/><w:qFormat/>"
+                   "<w:pPr><w:outlineLvl w:val=\"%2\"/></w:pPr>"
                    "</w:style>")
                    .arg(level)
                    .arg(level - 1);
@@ -615,14 +746,18 @@ QString stylesXml()
 
 QString sectPrXml(const data::PageSettings& page)
 {
+    // 页边距四个方向彼此独立。旧写法把 bottom 写成 top、left 写成 right，
+    // 上下或左右不对称的页面导出后版心位置会错。
     return QStringLiteral(
         "<w:sectPr><w:pgSz w:w=\"%1\" w:h=\"%2\"/>"
-        "<w:pgMar w:top=\"%3\" w:right=\"%4\" w:bottom=\"%3\" w:left=\"%4\" "
+        "<w:pgMar w:top=\"%3\" w:right=\"%4\" w:bottom=\"%5\" w:left=\"%6\" "
         "w:header=\"708\" w:footer=\"708\" w:gutter=\"0\"/></w:sectPr>")
         .arg(toTwips(page.size.width()))
         .arg(toTwips(page.size.height()))
-        .arg(toTwips(page.margins.top()))
-        .arg(toTwips(page.margins.left()));
+        .arg(qMax(0, toTwips(page.margins.top())))
+        .arg(qMax(0, toTwips(page.margins.right())))
+        .arg(qMax(0, toTwips(page.margins.bottom())))
+        .arg(qMax(0, toTwips(page.margins.left())));
 }
 
 QString documentOpenXml()
@@ -707,6 +842,31 @@ DocxExportResult validateInput(const data::DocumentSnapshot& doc,
             plan.relativeHeight = 251659264 + int(floats->size());
             floats->insert(node.id, plan);
         }
+
+        // 图片容器必须在排版结果里有绘制信息、在资源表里有原图，并且已经
+        // 登记了关系 ID。旧版只在写块时兜底成一个空段落，还照样返回 Ok，
+        // 用户拿到的是「少了一张图但导出成功」的 DOCX。
+        if (node.type == data::ContainerType::Image) {
+            const ImageLayout* image = findImage(layout, node.id);
+            if (!image)
+                return {DocxExportStatus::IoError,
+                        QStringLiteral("排版结果缺少图片绘制信息：%1").arg(node.id),
+                        node.id};
+            if (image->resourceId != node.image.resourceId)
+                return {DocxExportStatus::IoError,
+                        QStringLiteral("图片资源标识与快照不一致：%1").arg(node.id),
+                        node.id};
+            if (!relIdByContainer.contains(node.id))
+                return {DocxExportStatus::IoError,
+                        QStringLiteral("图片资源未登记关系：%1").arg(node.id),
+                        node.id};
+            const auto resource = doc.resources.constFind(image->resourceId);
+            if (resource == doc.resources.constEnd() || resource->isNull())
+                return {DocxExportStatus::IoError,
+                        QStringLiteral("图片资源缺失或无法解码：%1").arg(image->resourceId),
+                        node.id};
+        }
+
         for (const auto& child : node.children) {
             const DocxExportResult r = walk(child, &node, depth + 1);
             if (r.status != DocxExportStatus::Ok) return r;
@@ -761,6 +921,7 @@ DocxBuildResult buildDocx(const data::DocumentSnapshot& doc, const LayoutResult&
     // 3. 顶层顺序块：前块尾部间距写进下一块第一段的 before。
     //    行内图片的 docPr 编号接在浮动对象之后，保证全文档唯一。
     WriterState state;
+    state.doc = &doc;
     state.layout = &layout;
     state.floats = &floats;
     state.relIdByContainer = &relIdByContainer;

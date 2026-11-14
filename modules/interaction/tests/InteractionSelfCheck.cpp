@@ -565,9 +565,36 @@ static void testIme()
     replacement.replacementStart = 2;
     replacement.replacementLength = 3;
     auto cursorOnly = ei::applyIme(oldPreedit, replacement, doc, layout);
-    check(cursorOnly.requests.empty(), QStringLiteral("replacement attributes do not edit document"));
+    // 没有上屏文字时，替换范围只用来推导预编辑光标，确实不该编辑文档。
+    check(cursorOnly.requests.empty(), QStringLiteral("preedit-only event never edits document"));
     check(cursorOnly.state.preedit.cursorInPreedit == 5,
           QStringLiteral("replacement attributes compute preedit cursor at 5"));
+
+    // 带上屏文字时，replacementStart/Length 必须变成真正的 Replace 请求。
+    // 旧断言把「忽略替换范围」当成了正确行为，正好把 bug 锁死在测试里。
+    ei::ImeInput imeReplaceCommit;
+    imeReplaceCommit.commit = QStringLiteral("H");
+    imeReplaceCommit.replacementStart = -1;
+    imeReplaceCommit.replacementLength = 1;
+    auto replacedByIme = ei::applyIme(ei::makeInitialState(doc, layout, body, 10),
+                                      imeReplaceCommit, doc, layout);
+    check(replacedByIme.requests.size() == 1
+              && replacedByIme.requests[0].op == ei::EditOp::Replace
+              && replacedByIme.requests[0].range.start == 9
+              && replacedByIme.requests[0].range.end == 10
+              && replacedByIme.requests[0].text == QStringLiteral("H"),
+          QStringLiteral("IME replacement becomes a Replace request over [9,10)"));
+    check(replacedByIme.state.caret.offset == 10,
+          QStringLiteral("caret stays after the replaced text"));
+
+    // preeditCursor = 0 是「光标在最前面」，不能被当成「输入法没给」。
+    ei::ImeInput zeroCursor;
+    zeroCursor.preedit = QStringLiteral("abc");
+    zeroCursor.preeditCursor = 0;
+    auto atStart = ei::applyIme(ei::makeInitialState(doc, layout, body, 10),
+                                zeroCursor, doc, layout);
+    check(atStart.state.preedit.cursorInPreedit == 0,
+          QStringLiteral("preeditCursor=0 is a real cursor position"));
 }
 
 // U05：工具栏字符格式与段落角色转成有序的 EditRequest。
@@ -722,6 +749,112 @@ static void testController()
           QStringLiteral("controller selectAll covers current container"));
 }
 
+// 回归用例：把本轮修掉的每一类问题各写一条断言，防止以后被改回去。
+static void testInteractionRegressions()
+{
+    out << "\n=== R: interaction regression cases ===\n";
+    const auto fixture = et::makeLayoutCase(QStringLiteral("02"));
+    const auto layout  = et::makeStandardLayout(QStringLiteral("02"));
+    const ed::DocumentSnapshot& doc = fixture.document;
+    const QString body = QStringLiteral("body");
+
+    // 粘贴和输入法上屏也要过滤 XML 非法控制字符，不能只有键盘直输检查。
+    QString dirty = QStringLiteral("A");
+    dirty.append(QChar(0x01));
+    dirty.append(QChar(0x7f));
+    dirty.append(QStringLiteral("B"));
+    auto pasted = ei::applyPaste(ei::makeInitialState(doc, layout, body, 10),
+                                 dirty, doc, layout);
+    check(pasted.requests.size() == 1
+              && pasted.requests[0].text == QStringLiteral("AB"),
+          QStringLiteral("paste strips XML-illegal control characters"));
+    ei::ImeInput dirtyIme;
+    dirtyIme.commit = dirty;
+    auto imeIn = ei::applyIme(ei::makeInitialState(doc, layout, body, 10),
+                              dirtyIme, doc, layout);
+    check(imeIn.requests.size() == 1
+              && imeIn.requests[0].text == QStringLiteral("AB"),
+          QStringLiteral("IME commit strips XML-illegal control characters"));
+
+    // 没有选区时 Ctrl+C 不应该把系统剪贴板清空。
+    auto emptyCopy = ei::applyKey(ei::makeInitialState(doc, layout, body, 10),
+                                  makeKey(Qt::Key_C, Qt::ControlModifier), doc, layout);
+    check(!emptyCopy.clipboardText.has_value(),
+          QStringLiteral("Ctrl+C without a selection leaves the clipboard untouched"));
+
+    // 光标一移动或删除，折叠光标处设的待用格式就该失效。
+    ed::TextStyleOverride bold;
+    bold.bold = true;
+    auto pending = ei::applyCharFormat(ei::makeInitialState(doc, layout, body, 10),
+                                       doc, layout, bold);
+    check(pending.state.pendingCharStyle.has_value(),
+          QStringLiteral("pending style is set before the caret moves"));
+    auto moved = ei::applyKey(pending.state, makeKey(Qt::Key_Right), doc, layout);
+    check(!moved.state.pendingCharStyle.has_value(),
+          QStringLiteral("moving the caret invalidates the pending character style"));
+    auto deleted = ei::applyKey(pending.state, makeKey(Qt::Key_Backspace), doc, layout);
+    check(!deleted.state.pendingCharStyle.has_value(),
+          QStringLiteral("deleting invalidates the pending character style"));
+
+    // 连续上下移动要一直沿用第一次记下的期望列。
+    auto down1 = ei::applyKey(ei::makeInitialState(doc, layout, body, 100),
+                              makeKey(Qt::Key_Down), doc, layout);
+    check(down1.state.desiredCaretX.has_value(),
+          QStringLiteral("first Down records the desired column"));
+    auto down2 = ei::applyKey(down1.state, makeKey(Qt::Key_Down), doc, layout);
+    if (down1.state.desiredCaretX && down2.state.desiredCaretX)
+        check(qFuzzyCompare(*down1.state.desiredCaretX, *down2.state.desiredCaretX),
+              QStringLiteral("second Down reuses the same desired column"));
+    auto sideways = ei::applyKey(down2.state, makeKey(Qt::Key_Left), doc, layout);
+    check(!sideways.state.desiredCaretX.has_value(),
+          QStringLiteral("a horizontal move clears the desired column"));
+
+    // 鼠标从右往左反向拖选后，Shift+方向键必须用保存的锚点。
+    ei::InteractionState reverseSelection = ei::makeInitialState(doc, layout, body, 46);
+    reverseSelection.selection = ei::makeSelection(layout, body, ed::TextRange{20, 46});
+    reverseSelection.selectionAnchor = 46;
+    auto shiftLeft = ei::applyKey(reverseSelection,
+                                  makeKey(Qt::Key_Left, Qt::ShiftModifier), doc, layout);
+    check(shiftLeft.state.selectionAnchor == 46
+              && shiftLeft.state.selection.has_value()
+              && shiftLeft.state.selection->range.start < 46,
+          QStringLiteral("Shift+Left keeps the stored anchor after a reverse drag"));
+
+    // 段落格式请求不能只覆盖前 128 段。
+    ed::DocumentSnapshot many;
+    ed::ContainerNode longNode;
+    longNode.id = QStringLiteral("long");
+    longNode.type = ed::ContainerType::Text;
+    for (int i = 0; i < 200; ++i)
+        longNode.text.text += QStringLiteral("a\n");
+    many.root.children.push_back(longNode);
+    const auto ranges = ei::paragraphRangesFor(
+        many, longNode.id,
+        ed::TextRange{0, static_cast<int>(longNode.text.text.size())});
+    check(ranges.size() > 128,
+          QStringLiteral("paragraphRangesFor covers %1 paragraphs (no 128 cap)")
+              .arg(static_cast<int>(ranges.size())));
+
+    // 边界判断不能把本来就在边界上的位置往左挪一格。
+    check(ei::isGraphemeBoundary(QStringLiteral("abc"), 2),
+          QStringLiteral("a plain character offset is a grapheme boundary"));
+    check(ei::alignToGrapheme(QStringLiteral("abc"), 2) == 2,
+          QStringLiteral("alignToGrapheme leaves an existing boundary unchanged"));
+    QString emoji = QStringLiteral("a");
+    emoji.append(QChar(0xD83D));
+    emoji.append(QChar(0xDE00));
+    emoji.append(QStringLiteral("b"));
+    check(ei::alignToGrapheme(emoji, 2) != 2,
+          QStringLiteral("the middle of an emoji pair is snapped to a boundary"));
+
+    // 页边空白点击要兼顾水平距离，不能只按 y 归到左边的正文容器。
+    // case 06 右侧有一个浮动的 note 文本框，点在它下方偏右的空白处。
+    const auto layout6 = et::makeStandardLayout(QStringLiteral("06"));
+    const ei::Hit blankRight = ei::hitTest(layout6, QPointF(650, 560));
+    check(blankRight.containerId == QStringLiteral("note"),
+          QStringLiteral("blank click below the right-hand box picks that container"));
+}
+
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
@@ -734,6 +867,7 @@ int main(int argc, char** argv)
     testIme();
     testToolbarFormatting();
     testController();
+    testInteractionRegressions();
 
     out << "\n===== Interaction self-check: ";
     if (failures == 0)

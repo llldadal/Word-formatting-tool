@@ -35,18 +35,35 @@ QString normalizeNewlines(const QString& raw)
     return out;
 }
 
-bool isInsertableText(const QString& text)
+// 文档正文只接受换行、制表符和正常字符。C0 控制符、DEL、U+FFFE/U+FFFF
+// 以及孤立的 UTF-16 代理项写进 DOCX 会生成非法 XML，统一在这里剔除。
+// 键盘直输、粘贴、输入法上屏都走这一个入口，避免某条路径绕过检查。
+QString sanitizeForInsert(const QString& raw)
 {
-    if (text.isEmpty())
-        return false;
-    for (int i = 0; i < text.size(); ++i) {
-        const unsigned int u = static_cast<unsigned int>(text.at(i).unicode());
-        if (u == 0x0a || u == 0x0d || u == 0x09)
+    QString out;
+    out.reserve(raw.size());
+    for (int i = 0; i < raw.size(); ++i) {
+        const unsigned int u = static_cast<unsigned int>(raw.at(i).unicode());
+        if (u == 0x0a || u == 0x09) {
+            out.append(raw.at(i));
+        } else if (u < 0x20 || u == 0x7f || u == 0xfffe || u == 0xffff) {
             continue;
-        if (u < 0x20 || u == 0x7f)
-            return false;
+        } else if (u >= 0xd800 && u <= 0xdbff) {
+            // 高代理项必须紧跟一个低代理项，否则丢弃。
+            if (i + 1 < raw.size()) {
+                const unsigned int low = static_cast<unsigned int>(raw.at(i + 1).unicode());
+                if (low >= 0xdc00 && low <= 0xdfff) {
+                    out.append(raw.at(i));
+                    out.append(raw.at(++i));
+                }
+            }
+        } else if (u >= 0xdc00 && u <= 0xdfff) {
+            continue; // 孤立的低代理项。
+        } else {
+            out.append(raw.at(i));
+        }
     }
-    return true;
+    return out;
 }
 
 bool hasCharStyle(const data::TextStyleOverride& style)
@@ -173,26 +190,55 @@ int imeCursorPosition(const ImeInput& ime,
                       const QString& previousPreedit,
                       const QString& currentPreedit)
 {
-    int cursor = ime.preeditCursor;
-    if (cursor <= 0) {
-        if (ime.replacementStart != 0 || ime.replacementLength != 0) {
-            int base = ime.replacementStart;
-            if (base < 0)
-                base = static_cast<int>(previousPreedit.size()) + base;
-            cursor = base + ime.replacementLength;
-        } else {
-            cursor = static_cast<int>(currentPreedit.size());
-        }
+    // 0 是合法的光标位置（预编辑串最前面），只有负数才表示「输入法没给」。
+    if (ime.preeditCursor >= 0)
+        return qBound(0, ime.preeditCursor, static_cast<int>(currentPreedit.size()));
+
+    int cursor = static_cast<int>(currentPreedit.size());
+    if (ime.replacementStart != 0 || ime.replacementLength != 0) {
+        int base = ime.replacementStart;
+        if (base < 0)
+            base = static_cast<int>(previousPreedit.size()) + base;
+        cursor = base + ime.replacementLength;
     }
     return qBound(0, cursor, static_cast<int>(currentPreedit.size()));
+}
+
+// 在容器正文上把 UTF-16 偏移对齐到最近的字形簇边界，避免把一个 emoji
+// 或「字母+组合音标」从中间切成两半。输入法给的长度按 UTF-16 单元计。
+int alignInContainer(const data::DocumentSnapshot& doc,
+                     const data::ContainerId& id, int pos)
+{
+    const data::TextContent* content = findTextContent(doc, id);
+    if (!content)
+        return qMax(0, pos);
+    return alignToGrapheme(content->text, pos);
+}
+
+// 输入法上屏时要求替换的文档范围。空范围表示「只是插入，不删旧字」。
+// 有选区时选区优先，因为用户先拖选再打字，意图是替换选区内容。
+data::TextRange imeReplacementRange(const ImeInput& ime,
+                                    const InteractionState& state,
+                                    const data::DocumentSnapshot& doc)
+{
+    if (ime.replacementLength <= 0 || state.selection)
+        return {};
+    const data::ContainerId id = activeContainer(state);
+    const int caret = qBound(0, state.caret.offset, textLength(doc, id));
+    const int rawStart = caret + ime.replacementStart;
+    const int start = alignInContainer(doc, id, rawStart);
+    const int end = alignInContainer(doc, id, rawStart + ime.replacementLength);
+    return normalizeRange(data::TextRange{start, end});
 }
 
 InteractionOutput insertText(const InteractionState& state,
                              const QString& rawText,
                              const data::DocumentSnapshot& doc,
-                             const data::LayoutResult& layout)
+                             const data::LayoutResult& layout,
+                             const std::optional<data::TextRange>& forcedRange = std::nullopt)
 {
-    const QString text = normalizeNewlines(rawText);
+    // 统一入口：键盘、粘贴、输入法上屏都在这里做换行归一化和非法字符清洗。
+    const QString text = sanitizeForInsert(normalizeNewlines(rawText));
     InteractionOutput out = noOp(state);
     if (text.isEmpty())
         return out;
@@ -204,7 +250,12 @@ InteractionOutput insertText(const InteractionState& state,
 
     EditRequest request;
     request.containerId = id;
-    if (selection) {
+    if (forcedRange) {
+        // 输入法要求替换光标附近已有的文字（例如重新选词、纠错）。
+        request.op = EditOp::Replace;
+        request.range = clampTextRange(doc, id, *forcedRange);
+        at = request.range.start;
+    } else if (selection) {
         request.op = EditOp::Replace;
         request.range = *selection;
         at = selection->start;
@@ -227,8 +278,10 @@ InteractionOutput insertText(const InteractionState& state,
 
     out.state.caret = makeCaret(layout, id, at + insertedLength);
     out.state.selection.reset();
+    out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
     out.state.pendingCharStyle.reset();
+    out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
 }
@@ -262,7 +315,10 @@ InteractionOutput deleteText(const InteractionState& state,
 
     out.state.caret = makeCaret(layout, id, range.start);
     out.state.selection.reset();
+    out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
+    out.state.pendingCharStyle.reset();
+    out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
 }
@@ -274,7 +330,10 @@ InteractionOutput copyOrCut(const InteractionState& state,
 {
     InteractionOutput out = noOp(state);
     const auto selection = selectionRangeOf(state, doc);
-    out.clipboardText = selectedText(state, doc);
+    // 没有选区时不能写剪贴板：optional 有值哪怕是空串，UI 也会据此把系统
+    // 剪贴板清掉，导致「无选中按 Ctrl+C」把之前复制的内容弄丢。
+    if (selection)
+        out.clipboardText = selectedText(state, doc);
     if (!cut || !selection)
         return out;
 
@@ -287,7 +346,10 @@ InteractionOutput copyOrCut(const InteractionState& state,
 
     out.state.caret = makeCaret(layout, id, selection->start);
     out.state.selection.reset();
+    out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
+    out.state.pendingCharStyle.reset();
+    out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
 }
@@ -301,7 +363,10 @@ InteractionOutput selectAllText(const InteractionState& state,
     const data::TextRange range = selectAllRange(doc, id);
     out.state.caret = makeCaret(layout, id, range.end);
     out.state.selection = makeSelection(layout, id, range);
+    out.state.selectionAnchor = range.start;
     out.state.preedit = PreeditState{};
+    out.state.pendingCharStyle.reset();
+    out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
 }
@@ -310,7 +375,8 @@ int movedOffset(const EditAction& action,
                 const data::DocumentSnapshot& doc,
                 const data::LayoutResult& layout,
                 const data::ContainerId& id,
-                int from)
+                int from,
+                qreal desiredX)
 {
     const int len = textLength(doc, id);
     const int at = qBound(0, from, len);
@@ -337,7 +403,9 @@ int movedOffset(const EditAction& action,
         }
         const qreal step = rect.height() > 1.0 ? rect.height() : 26.0;
         const qreal dy = action.kind == EditActionKind::MoveDown ? step : -step;
-        const QPointF target(rect.center().x(), rect.center().y() + dy);
+        // 用记住的期望列当目标 x，而不是当前光标的 x；否则连续上下移动时
+        // 每行字宽不同，光标会一行一行往左漂。
+        const QPointF target(desiredX, rect.center().y() + dy);
         const Hit hit = clampFocus(layout, Hit{id, at}, target);
         return qBound(0, hit.offset, len);
     }
@@ -368,22 +436,43 @@ InteractionOutput moveCaret(const InteractionState& state,
             : state.selection->range.end;
     }
 
-    const int to = movedOffset(action, doc, layout, id, from);
+    const bool vertical = action.kind == EditActionKind::MoveUp
+                       || action.kind == EditActionKind::MoveDown;
+    qreal targetX = state.caret.rect.center().x();
+    if (vertical) {
+        // 第一次按上下键时记下当前列；连续按上下键时一直沿用这一列。
+        targetX = state.desiredCaretX.value_or(caretRect(layout, id, from).center().x());
+    }
+
+    const int to = movedOffset(action, doc, layout, id, from, targetX);
     out.state.caret = makeCaret(layout, id, to);
     out.state.caret.containerId = id;
 
     if (action.extendSelection) {
-        const int anchor = state.selection
-            ? (movesBackward(action.kind) ? state.selection->range.end
-                                          : state.selection->range.start)
-            : from;
-        if (anchor == to)
+        // 锚点是选区固定不动的那一端，必须显式保存。仅靠「移动方向的反方向」
+        // 去猜端点，在鼠标反向拖选后再按 Shift+方向键时就会把锚点认错。
+        const int anchor = (state.selection && state.selectionAnchor)
+                         ? *state.selectionAnchor
+                         : from;
+        if (anchor == to) {
             out.state.selection.reset();
-        else
+            out.state.selectionAnchor.reset();
+        } else {
             out.state.selection = makeSelection(layout, Hit{id, anchor}, Hit{id, to});
+            out.state.selectionAnchor = anchor;
+        }
     } else {
         out.state.selection.reset();
+        out.state.selectionAnchor.reset();
     }
+
+    // 光标位置一变，之前在工具栏设的待用格式就不该继续使用；期望列只在
+    // 连续上下移动时保留，其它移动一律清空。
+    out.state.pendingCharStyle.reset();
+    if (vertical)
+        out.state.desiredCaretX = targetX;
+    else
+        out.state.desiredCaretX.reset();
 
     out.state = refreshStateGeometry(out.state, layout);
     return out;
@@ -527,7 +616,9 @@ std::vector<data::TextRange> paragraphRangesFor(const data::DocumentSnapshot& do
         return result;
 
     int cursor = clamped.start;
-    while (cursor <= clamped.end && result.size() < 128) {
+    // 不再用固定的 128 段上限截断：超过 128 段时后面的段落会收不到格式请求。
+    // 循环仍保证每次 cursor 至少前进 1，空段落也不会造成死循环。
+    while (cursor <= clamped.end) {
         const data::TextRange current = paragraphRangeAt(doc, id, cursor);
         result.push_back(current);
         if (current.end >= clamped.end)
@@ -758,8 +849,9 @@ InteractionOutput applyKey(const InteractionState& state,
         typed = QStringLiteral(" ");
     if (typed.isEmpty() && key.key == Qt::Key_Tab)
         typed = QStringLiteral("\t");
-    typed = normalizeNewlines(typed);
-    if (!isInsertableText(typed))
+    // 键盘直输也走和粘贴、输入法上屏相同的清洗，避免只有一条路径被检查。
+    typed = sanitizeForInsert(normalizeNewlines(typed));
+    if (typed.isEmpty())
         return noOp(state);
 
     action.kind = EditActionKind::InsertText;
@@ -780,13 +872,20 @@ InteractionOutput applyIme(const InteractionState& state,
                            const data::DocumentSnapshot& doc,
                            const data::LayoutResult& layout)
 {
-    const QString commit = normalizeNewlines(ime.commit);
+    const QString commit = sanitizeForInsert(normalizeNewlines(ime.commit));
     const QString preedit = normalizeNewlines(ime.preedit);
     const QString previousPreedit = state.preedit.text;
 
-    InteractionOutput out = commit.isEmpty()
-        ? noOp(state)
-        : insertText(state, commit, doc, layout);
+    InteractionOutput out = noOp(state);
+    if (!commit.isEmpty()) {
+        // 输入法可能要求用上屏文字替换掉光标附近已有的字（重选词、纠错）。
+        // 忽略 replacementStart/Length 会把这类事件当成纯插入，文档里留下旧字。
+        const data::TextRange replacement = imeReplacementRange(ime, state, doc);
+        if (replacement.start < replacement.end)
+            out = insertText(state, commit, doc, layout, replacement);
+        else
+            out = insertText(state, commit, doc, layout);
+    }
 
     if (!preedit.isEmpty()) {
         PreeditState next;

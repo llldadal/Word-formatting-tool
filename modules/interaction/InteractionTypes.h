@@ -92,6 +92,12 @@ struct InteractionState {
     std::optional<SelectionState>  selection;
     PreeditState                   preedit;
     std::optional<data::TextStyleOverride> pendingCharStyle; // 折叠光标时工具栏待用的字符格式。
+    // 选区固定不动的那一端（相对 selection->containerId）。Shift+方向键扩展
+    // 选区时必须用它当锚点；只按移动方向去猜端点，反向拖选后会认错锚点。
+    std::optional<int> selectionAnchor;
+    // 连续按上下键时记住最初那一列的纸张 x。每行字宽不同，如果每次都用
+    // 当前光标的 x 当目标，光标会一行一行往左漂。左右移动、编辑、鼠标点击后清空。
+    std::optional<qreal> desiredCaretX;
 };
 
 // 一次事件的结果。UI 先执行请求，再用新版面调用 refreshStateGeometry。
@@ -111,8 +117,14 @@ struct KeyInput {
 struct ImeInput {
     QString preedit;              // 当前完整预编辑串，不是文档插入内容。
     QString commit;               // 只上屏一次的文字。
-    int     preeditCursor     = 0;
-    int     replacementStart  = 0; // 相对上一次预编辑串，不构成文档编辑。
+    // 预编辑串内的光标位置。0 是合法值（光标在最前面），所以负数才表示
+    // 输入法没有给出光标属性，需要按替换范围或串尾推导。
+    int     preeditCursor     = -1;
+    // 这两个字段描述「上屏时要替换掉光标附近的多少文字」，基准点是本次
+    // 预编辑串的起点，也就是文档里的当前光标。start 为负表示往光标左侧数。
+    // 本模块的预编辑不写入文档，所以 commit 时必须据此生成 Replace 请求，
+    // 否则输入法要求的重选词、纠错替换会被当成纯插入，文档里多出旧字。
+    int     replacementStart  = 0;
     int     replacementLength = 0;
 };
 

@@ -75,4 +75,28 @@ int prevBoundary(const data::DocumentSnapshot& doc, const data::ContainerId& id,
     return content ? prevBoundary(content->text, pos) : 0;
 }
 
+bool isGraphemeBoundary(const QString& text, int pos)
+{
+    if (text.isEmpty())
+        return true;
+    const int at = qBound(0, pos, static_cast<int>(text.size()));
+    if (at == 0 || at == text.size())
+        return true;
+    // 先退到前一个边界，再看紧随其后的边界是不是 pos 本身。
+    const int before = prevBoundary(text, at);
+    return nextBoundary(text, before) == at;
+}
+
+int alignToGrapheme(const QString& text, int pos)
+{
+    if (text.isEmpty())
+        return 0;
+    const int at = qBound(0, pos, static_cast<int>(text.size()));
+    if (isGraphemeBoundary(text, at))
+        return at;
+    const int before = prevBoundary(text, at);
+    const int after = nextBoundary(text, at);
+    return (at - before <= after - at) ? before : after;
+}
+
 } // 命名空间 editor::interaction 结束

@@ -393,7 +393,11 @@ void DocumentCanvas::mousePressEvent(QMouseEvent* event)
     state.caret.offset = hit.offset;
     state.caret.rect = ei::caretRect(layout_, hit.containerId, hit.offset);
     state.selection.reset();
+    state.selectionAnchor.reset();
     state.preedit = ei::PreeditState{};
+    // 鼠标换了位置，工具栏待用格式、上下移动的期望列都不该继续生效。
+    state.pendingCharStyle.reset();
+    state.desiredCaretX.reset();
     controller_.setState(state);
     controller_.refresh(layout_);
     update();
@@ -418,6 +422,9 @@ void DocumentCanvas::mouseMoveEvent(QMouseEvent* event)
     state.caret.containerId = anchor_.containerId;
     state.caret.offset = focus.offset;
     state.selection = ei::makeSelection(layout_, anchor_, focus);
+    state.selectionAnchor = anchor_.offset;
+    state.pendingCharStyle.reset();
+    state.desiredCaretX.reset();
     controller_.setState(state);
     controller_.refresh(layout_);
     update();
