@@ -60,13 +60,15 @@ public:
     // index 是移动完成后从 0 开始的下标。换父时可插到目标列表末尾。
     // 移入正文时需给出相对新父内容区的位置。
     // 省略 position 时，同级移动沿用原位置，换到顺序排版的父节点则使用 (0, 0) 作为期望位置。
+    // 换父后文本或分组的内容宽度不足时，移动失败。
     bool moveNode(const data::ContainerId& id, const data::ContainerId& targetParentId,
                   std::size_t index, std::optional<QPointF> position = std::nullopt);
 
     // 删除容器及其所有子节点，保留图片资源。逻辑根不可删除。
     bool removeNode(const data::ContainerId& id);
 
-    // 更新容器的期望位置、尺寸约束和边距。文本和分组指定固定框宽时，内容区宽度必须为正。
+    // 更新容器的期望位置、尺寸约束和边距。文本和分组的内容宽度必须为有限的正数。
+    // 修改父容器时，同时检查受影响的子节点。
     bool setContainerGeometry(const data::ContainerId& id, const data::ContainerGeometry& geometry);
 
     // range 使用 UTF-16 的 [start, end)。空范围用于插入，空 replacement 用于删除。
@@ -112,13 +114,14 @@ private:
 
     static data::ContainerNode exportNode(const DocumentNode& node);
     bool importNode(const data::ContainerNode& source, DocumentNode* parent,
-                    std::unique_ptr<DocumentNode>& destination, QString* error);
+                    std::unique_ptr<DocumentNode>& destination, qreal parentWidth, QString* error);
 
     bool replaceTextImpl(const data::ContainerId& id, data::TextRange range, const QString& replacement,
                          const std::vector<data::TextFormatSpan>& replacementFormats, bool replaceFormatting);
 
     // 未找到时返回 nullptr。节点指针仅在当前操作中使用。
     DocumentNode* findNode(const data::ContainerId& id) const;
+    qreal parentContentWidth(const DocumentNode& parent) const;
     void setImageResource(DocumentNode& node, const data::ResourceId& resourceId);
     void removeSubtreeFromIndex(const DocumentNode& node);
     std::optional<data::PlacementMode> placementForChild(const DocumentNode* parent) const;

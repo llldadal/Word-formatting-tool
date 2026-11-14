@@ -35,6 +35,11 @@ using data::TextStyleOverride;
 
 namespace {
 
+bool finitePositive(qreal value)
+{
+    return std::isfinite(value) && value > 0;
+}
+
 bool finiteNonnegative(qreal value)
 {
     return std::isfinite(value) && value >= 0;
@@ -48,26 +53,41 @@ bool validMargins(const QMarginsF& margins)
 
 bool validSize(const QSizeF& size)
 {
-    return std::isfinite(size.width()) && size.width() > 0 &&
-           std::isfinite(size.height()) && size.height() > 0;
+    return finitePositive(size.width()) && finitePositive(size.height());
+}
+
+qreal pageContentWidth(const PageSettings& page)
+{
+    return page.size.width() - page.margins.left() - page.margins.right();
 }
 
 bool validPage(const PageSettings& page)
 {
     const auto& margins = page.margins;
     return validSize(page.size) && validMargins(margins) &&
-           margins.left() + margins.right() < page.size.width() &&
+           finitePositive(pageContentWidth(page)) &&
            margins.top() + margins.bottom() < page.size.height();
 }
 
-bool validGeometry(const ContainerGeometry& geometry, ContainerType type)
+bool validGeometry(const ContainerGeometry& geometry)
 {
-    // 文本和分组的固定框宽须容纳左右内边距，并给内容留出正宽度。
-    const bool hasFixedWidth = (type == ContainerType::Text || type == ContainerType::Group) && geometry.width > 0;
     return std::isfinite(geometry.position.x()) && std::isfinite(geometry.position.y()) &&
            finiteNonnegative(geometry.width) && finiteNonnegative(geometry.minimumHeight) &&
-           validMargins(geometry.padding) && validMargins(geometry.margin) &&
-           (!hasFixedWidth || geometry.width > geometry.padding.left() + geometry.padding.right());
+           validMargins(geometry.padding) && validMargins(geometry.margin);
+}
+
+bool usesGeometryWidth(ContainerType type)
+{
+    return type == ContainerType::Text || type == ContainerType::Group;
+}
+
+qreal contentWidth(const ContainerGeometry& geometry, qreal parentWidth)
+{
+    // 自动框宽扣除左右外边距。内容宽度的计算顺序与排版中的 QRectF::adjusted 一致。
+    const qreal frameWidth = geometry.width == 0
+        ? parentWidth - geometry.margin.left() - geometry.margin.right()
+        : geometry.width;
+    return frameWidth - geometry.padding.right() - geometry.padding.left();
 }
 
 bool validParagraphFormat(const ParagraphFormat& format)
@@ -454,7 +474,7 @@ std::optional<Document> Document::fromSnapshot(const DocumentSnapshot& snapshot,
     // 在新文档中重建整棵树。中途遇到非法节点时，丢弃这份文档。
     Document document(snapshot.resources);
     document.nodesById_.clear();
-    if (!document.importNode(snapshot.root, nullptr, document.root_, error)) {
+    if (!document.importNode(snapshot.root, nullptr, document.root_, pageContentWidth(snapshot.page), error)) {
         return std::nullopt;
     }
     document.page_ = snapshot.page;
@@ -491,13 +511,24 @@ ContainerNode Document::exportNode(const DocumentNode& node)
 }
 
 bool Document::importNode(const ContainerNode& source, DocumentNode* parent,
-                          std::unique_ptr<DocumentNode>& destination, QString* error)
+                          std::unique_ptr<DocumentNode>& destination, qreal parentWidth, QString* error)
 {
     if (source.id.isEmpty() || nodesById_.contains(source.id)) {
         return rejectNode(source.id, QStringLiteral("ID 为空或重复"), error);
     }
-    if (!validGeometry(source.geometry, source.type)) {
+    if (!validGeometry(source.geometry)) {
         return rejectNode(source.id, QStringLiteral("几何属性无效"), error);
+    }
+    // 逻辑根直接沿用页面正文宽度，保留快照中已有的根节点几何校验。
+    qreal width = parentWidth;
+    if (usesGeometryWidth(source.type) && (parent != nullptr || source.geometry.width > 0)) {
+        const qreal nodeWidth = contentWidth(source.geometry, parentWidth);
+        if (!finitePositive(nodeWidth)) {
+            return rejectNode(source.id, QStringLiteral("内容宽度必须为有限的正数，请检查框宽和左右边距"), error);
+        }
+        if (parent != nullptr) {
+            width = nodeWidth;
+        }
     }
     if (parent != nullptr) {
         const auto placement = placementForChild(parent);
@@ -537,7 +568,7 @@ bool Document::importNode(const ContainerNode& source, DocumentNode* parent,
     node->children_.reserve(source.children.size());
     for (const auto& child : source.children) {
         node->children_.emplace_back();
-        if (!importNode(child, node, node->children_.back(), error)) {
+        if (!importNode(child, node, node->children_.back(), width, error)) {
             return false;
         }
     }
@@ -663,6 +694,10 @@ bool Document::moveNode(const ContainerId& id, const ContainerId& targetParentId
     if (position && (!std::isfinite(position->x()) || !std::isfinite(position->y()))) {
         return false;
     }
+    if (!sameParent && usesGeometryWidth(node->data_.type) &&
+        !finitePositive(contentWidth(node->data_.geometry, parentContentWidth(*targetParent)))) {
+        return false;
+    }
 
     auto& sourceChildren = node->parent_->children_;
     const auto source = std::find_if(sourceChildren.begin(), sourceChildren.end(),
@@ -720,8 +755,20 @@ bool Document::setContainerGeometry(const ContainerId& id, const ContainerGeomet
         return false;
     }
 
-    if (!validGeometry(geometry, node->data_.type)) {
+    if (!validGeometry(geometry)) {
         return false;
+    }
+    if (usesGeometryWidth(node->data_.type)) {
+        const qreal width = contentWidth(geometry, parentContentWidth(*node->parent_));
+        if (!finitePositive(width)) {
+            return false;
+        }
+        // v0.1 只有一层子节点。用更新后的父内容宽度检查直接子节点。
+        for (const auto& child : node->children_) {
+            if (usesGeometryWidth(child->data_.type) && !finitePositive(contentWidth(child->data_.geometry, width))) {
+                return false;
+            }
+        }
     }
 
     // 坐标和边距逐项比较,不一致时才修改，一致时返回true但不执行修改
@@ -944,6 +991,13 @@ bool Document::setParagraphRole(const ContainerId& id, int textOffset, Paragraph
 DocumentNode* Document::findNode(const ContainerId& id) const
 {
     return nodesById_.value(id, nullptr);
+}
+
+qreal Document::parentContentWidth(const DocumentNode& parent) const
+{
+    // 允许接收子节点的父容器只有逻辑根和顶层容器。
+    const qreal width = pageContentWidth(page_);
+    return &parent == root_.get() ? width : contentWidth(parent.data_.geometry, width);
 }
 
 void Document::removeSubtreeFromIndex(const DocumentNode& node)
