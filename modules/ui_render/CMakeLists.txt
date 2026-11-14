@@ -1,7 +1,19 @@
-# UI 与绘图模块。窗口在 MainWindow.ui 中编辑，绘图与事件转发由负责人实现。
 add_library(EditorUiRender STATIC
     UiRenderModule.cpp
+    CanvasWidget.cpp
+    CanvasWidget.h
+    MainWindow.cpp
+    MainWindow.h
     MainWindow.ui
 )
-set_target_properties(EditorUiRender PROPERTIES AUTOUIC ON)
-target_link_libraries(EditorUiRender PUBLIC EditorData PRIVATE Qt6::Widgets)
+
+set_target_properties(EditorUiRender PROPERTIES AUTOUIC ON AUTOMOC ON)
+
+target_link_libraries(EditorUiRender
+    PUBLIC
+        EditorData
+        EditorLayout
+        Qt6::Widgets
+)
+
+target_include_directories(EditorUiRender PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
