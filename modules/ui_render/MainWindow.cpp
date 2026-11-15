@@ -12,6 +12,7 @@
 #include <QStringList>
 #include <QTimer>
 #include <QToolBar>
+#include <QWidget>
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -117,17 +118,22 @@ void MainWindow::applyParagraphStyle(int index) { showResult("更改段落样式
 void MainWindow::setZoom(qreal zoom)
 {
     zoom = qBound(0.25, zoom, 4.0);
-    QScrollBar* horizontal = ui->scrollArea->horizontalScrollBar();
-    QScrollBar* vertical = ui->scrollArea->verticalScrollBar();
-    const QPointF viewportCenter(horizontal->value() + ui->scrollArea->viewport()->width() / 2.0,
-                                 vertical->value() + ui->scrollArea->viewport()->height() / 2.0);
-    const QPointF centerPaper = ui->canvas->widgetToPaper(viewportCenter);
+    QWidget* viewport = ui->scrollArea->viewport();
+    const QPoint viewportCenter(viewport->width() / 2, viewport->height() / 2);
+    const QPoint canvasCenter = ui->canvas->mapFrom(viewport, viewportCenter);
+    const QPointF centerPaper = ui->canvas->widgetToPaper(QPointF(canvasCenter));
+
     ui->canvas->setZoom(zoom);
+
     QTimer::singleShot(0, this, [this, centerPaper]() {
-        const QPointF center = ui->canvas->paperToWidget(centerPaper);
-        ui->scrollArea->horizontalScrollBar()->setValue(static_cast<int>(center.x() - ui->scrollArea->viewport()->width() / 2.0));
-        ui->scrollArea->verticalScrollBar()->setValue(static_cast<int>(center.y() - ui->scrollArea->viewport()->height() / 2.0));
+        QWidget* viewport = ui->scrollArea->viewport();
+        const QPoint viewportCenter(viewport->width() / 2, viewport->height() / 2);
+        const QPoint canvasPoint = ui->canvas->paperToWidget(centerPaper).toPoint();
+        const QPoint viewportPoint = ui->canvas->mapTo(viewport, canvasPoint);
+        ui->scrollArea->horizontalScrollBar()->setValue(viewportPoint.x() - viewportCenter.x());
+        ui->scrollArea->verticalScrollBar()->setValue(viewportPoint.y() - viewportCenter.y());
     });
+
     updateStatus();
 }
 
