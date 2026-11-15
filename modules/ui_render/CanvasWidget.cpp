@@ -94,10 +94,6 @@ QRectF CanvasWidget::contentAreaInPaper() const
     }
 
     const qreal sanity = 4.0 * qMax(page.width(), page.height());
-    // 有效性检查只针对坐标本身：非有限值、或原点离纸张荒谬远才回退。
-    // 长文档向下/向右延伸多远都是合法内容，不能因此回退成一页，
-    // 否则末尾滚不到（复审问题 2）。控件尺寸上限由 rebuildGeometry 的
-    // kMaxCanvasExtent 单独处理：极端大缩放下触顶时，降低缩放即可查看末尾。
     const bool finite = std::isfinite(area.left()) && std::isfinite(area.top())
         && std::isfinite(area.width()) && std::isfinite(area.height());
     if (!finite || qAbs(area.left()) > sanity || qAbs(area.top()) > sanity) {
@@ -196,10 +192,6 @@ void CanvasWidget::paintContent(QPainter& painter) const
         }
 
         painter.save();
-        // 裁剪范围 = 可用区域 ∪ 片段字形实际占位：
-        // 正常片段仍按 rect 裁剪（同行多片段互不重叠、绕排避开障碍）；
-        // 排版保留的超宽单字形（宽度大于可用区域）按 cursorToX 换算出实际
-        // 占位并入裁剪区，避免被切掉（复审问题 3）。
         QRectF clip = fragment.rect;
         const int lineStart = line.textStart();
         const int lineLength = line.textLength();
