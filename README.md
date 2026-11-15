@@ -28,6 +28,7 @@
 │       ├── StandardRecords.inc
 │       ├── standards/
 │       └── reference/
+├── app/
 └── docs/
     └── v0.1-DOCX映射草案.md
 ```
@@ -69,22 +70,47 @@ shared 里的两个头文件包含完整契约及必要的字段类型，例如�
 | modules/interaction | EditorInteraction | 光标、容器内选区、键盘和鼠标编辑、中文输入法、修改请求 |
 | modules/ui_render | EditorUiRender | .ui 主窗口、文档绘制、缩放滚动、光标选区和输入法显示、事件转交 |
 | modules/io | EditorIO | 根据同版本的快照与几何结果导出可编辑 DOCX，并反馈结果 |
+| app | --- | 应用构建入口与模块链接 |
 
 每个模块当前的 cpp 文件是带职责注释的编译占位文件。负责人可以增加自己的头文件和实现，并将文件显式写入本模块的 CMakeLists.txt，使 Qt Creator 能在项目树中显示。
 
 五个业务模块分别依赖 EditorData。后续联调时，根据共同商定的模块调用接口增加必要依赖。
 
-## 构建方式
+## 完整项目构建方式
 
-在 Qt Creator 中打开本目录的 CMakeLists.txt，构建方式选择MinGW，运行 CMake 并构建。业务模块目前生成六个静态库；另外默认构建测试数据库、比较器和两个测试程序。主窗口界面文件可以在设计视图中编辑，UI 负责人接入程序入口后再生成应用程序。只构建业务骨架时，设置 EDITOR_BUILD_CONTRACT_TESTS=OFF。
+### 使用 Qt Creator 构建
 
-命令行也可以在配置好编译器、CMake、Ninja 和 Qt 环境的终端中运行。
+需要 Qt Creator、Qt 6.12 的 MinGW 64-bit Kit、CMake 3.21 或以上版本，以及 Ninja。
+
+1. 在 Qt Creator 中选择「文件 → 打开文件或项目」，打开仓库 `app` 目录下的 `CMakeLists.txt`。
+2. 在「配置项目」页面选择 `Desktop Qt 6.12.0 MinGW 64-bit`，勾选 `Debug`。
+3. 把 Debug 的构建目录设为可写的纯英文路径(!!!!!一定要纯纯英文，否则报错)，例如 `C:/qt-build/word-formatting-tool/app-debug`，然后点击「Configure Project」。已配置过的项目可以在「项目 → 构建设置」修改构建目录。
+4. 按 `Ctrl+B` 构建。在左下角的运行目标菜单中选择 `QtDocumentEditor`，按 `Ctrl+R` 启动。
+
+### 使用命令行构建
+
+在包含 `app` 和 `modules` 的仓库根目录打开 PowerShell。把 `$qtRoot` 改成自己的 Qt 安装目录，`$buildDir` 设为可写的纯英文路径。
 
 ```powershell
-cmake -S ./正式项目 -B ./build/editor-v0.1-data -G Ninja -DCMAKE_PREFIX_PATH="D:/Qt/6.12.0/mingw_64"
-cmake --build ./build/editor-v0.1-data
+$qtRoot = 'D:/qt'
+$qtKit = "$qtRoot/6.12.0/mingw_64"
+$mingwBin = "$qtRoot/Tools/mingw1310_64/bin"
+$cmake = "$qtRoot/Tools/CMake_64/bin/cmake.exe"
+$buildDir = 'C:/qt-build/word-formatting-tool/app-debug'
+
+$env:Path = "$qtKit/bin;$mingwBin;" + $env:Path
+
+& $cmake -S app -B $buildDir -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  "-DCMAKE_PREFIX_PATH=$qtKit" `
+  "-DCMAKE_CXX_COMPILER=$mingwBin/g++.exe" `
+  "-DCMAKE_MAKE_PROGRAM=$qtRoot/Tools/Ninja/ninja.exe"
+
+& $cmake --build $buildDir --target QtDocumentEditor
 ```
 
-当前测试位于 tests，共有十道测试题。固定输入、标准 LayoutResult、参考图和接入方法见 tests/README.md。
+构建成功后，在同一个 PowerShell 窗口运行。
 
-默认排版模块尚未接入，EditorLayoutTests 返回 NOT RUN 和退出码 2；EditorFixtureSelfCheck 仅检查测试数据及比较器自身，不能代表排版实现通过。
+```powershell
+& "$buildDir/QtDocumentEditor.exe"
+```
