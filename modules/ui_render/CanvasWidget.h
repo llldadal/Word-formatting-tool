@@ -73,5 +73,4 @@ private:
     static constexpr int kCanvasMargin = 36;
     static constexpr qreal kFallbackPaperWidth = 760;
     static constexpr qreal kFallbackPaperHeight = 1000;
-    static constexpr int kMaxCanvasExtent = 32767;
 };
