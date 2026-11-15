@@ -119,10 +119,11 @@ void CanvasWidget::rebuildGeometry()
     m_origin = QPointF(-area.left() * m_zoom + kCanvasMargin,
                        -area.top() * m_zoom + kCanvasMargin);
 
+    const qreal maxExtent = static_cast<qreal>(QWIDGETSIZE_MAX) - 2 * kCanvasMargin;
     const int contentWidth = qMax(static_cast<int>(
-        qMin<qreal>(std::ceil(area.width() * m_zoom), kMaxCanvasExtent)), 120);
+        qMin<qreal>(std::ceil(area.width() * m_zoom), maxExtent)), 120);
     const int contentHeight = qMax(static_cast<int>(
-        qMin<qreal>(std::ceil(area.height() * m_zoom), kMaxCanvasExtent)), 120);
+        qMin<qreal>(std::ceil(area.height() * m_zoom), maxExtent)), 120);
     setFixedSize(contentWidth + 2 * kCanvasMargin, contentHeight + 2 * kCanvasMargin);
 }
 
