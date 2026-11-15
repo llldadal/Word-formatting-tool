@@ -22,7 +22,9 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
-    void updateLayoutData(const editor::data::LayoutResult& result);
+    // 排版结果与文档快照必须成对、同版本更新，否则画布会因版本检查拒绝绘制正文。
+    void updateLayoutData(const editor::data::DocumentSnapshot& snapshot,
+                          const editor::data::LayoutResult& result);
 
 private slots:
     void newDocument();

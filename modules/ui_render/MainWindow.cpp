@@ -55,8 +55,10 @@ MainWindow::MainWindow(QWidget* parent)
 
     m_layoutResult.pageRect = QRectF(0, 0, 760, 1000);
     m_layoutResult.layoutBounds = m_layoutResult.pageRect;
+    // 空白页同样保证快照与结果同版本，画布的版本检查才不会误伤首次绘制。
+    m_layoutResult.documentRevision = m_snapshot.revision;
 
-    updateLayoutData(m_layoutResult);
+    updateLayoutData(m_snapshot, m_layoutResult);
 
     ui->canvas->setFocus();
 }
@@ -66,8 +68,10 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-void MainWindow::updateLayoutData(const editor::data::LayoutResult& result)
+void MainWindow::updateLayoutData(const editor::data::DocumentSnapshot& snapshot,
+                                  const editor::data::LayoutResult& result)
 {
+    m_snapshot = snapshot;
     m_layoutResult = result;
     ui->canvas->setDocumentData(m_snapshot, m_layoutResult);
     updateStatus();
