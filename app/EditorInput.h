@@ -1,9 +1,6 @@
 #pragma once
 
-#include "HitTest.h"
-
 #include <QWidget>
-#include <optional>
 
 class CanvasWidget;
 
@@ -37,7 +34,6 @@ private:
 
     CanvasWidget& canvas_;
     EditorSession& session_;
-    std::optional<interaction::Hit> dragAnchor_;
 };
 
 } // namespace editor::app

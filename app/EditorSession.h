@@ -27,6 +27,9 @@ public:
     const data::ParagraphInfo* currentParagraph() const;
 
     void select(const interaction::Hit& anchor, const interaction::Hit& focus);
+    bool beginSelection(QPointF paperPoint, bool extendSelection);
+    bool dragSelection(QPointF paperPoint);
+    bool endSelection();
     bool key(const interaction::KeyInput& key, const QString& clipboardText);
     bool ime(const interaction::ImeInput& ime);
     bool action(const interaction::EditAction& action);
@@ -46,6 +49,7 @@ private:
     data::DocumentSnapshot snapshot_;
     data::LayoutResult layout_;
     interaction::InteractionState state_;
+    std::optional<interaction::Hit> dragAnchor_;
     QHash<QString, data::ResourceId> importedImages_;
 };
 

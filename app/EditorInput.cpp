@@ -6,7 +6,7 @@
 #include "Selection.h"
 #include "TextBoundary.h"
 
-#include <QClipboard>
+#include <QAction>
 #include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QInputMethod>
@@ -120,39 +120,29 @@ void EditorInput::mousePressEvent(QMouseEvent* event)
     if (!session_.state().preedit.text.isEmpty())
         QGuiApplication::inputMethod()->commit();
 
-    const auto paper = canvas_.widgetToPaper(event->position());
-    auto focus = interaction::hitTest(session_.layout(), paper);
-    if (!focus.valid()) {
+    if (!session_.beginSelection(canvas_.widgetToPaper(event->position()),
+                                 event->modifiers().testFlag(Qt::ShiftModifier))) {
         event->ignore();
         return;
     }
-    dragAnchor_ = focus;
-    const auto& state = session_.state();
-    if (event->modifiers().testFlag(Qt::ShiftModifier)) {
-        dragAnchor_ = interaction::Hit{state.caret.containerId,
-                                      state.selectionAnchor.value_or(state.caret.offset)};
-        focus = interaction::clampFocus(session_.layout(), *dragAnchor_, paper);
-    }
-    session_.select(*dragAnchor_, focus);
     event->accept();
 }
 
 void EditorInput::mouseMoveEvent(QMouseEvent* event)
 {
     const auto paper = canvas_.widgetToPaper(event->position());
-    emit canvas_.pointerMoved(paper);
-    if (!dragAnchor_ || !event->buttons().testFlag(Qt::LeftButton)) {
+    if (!event->buttons().testFlag(Qt::LeftButton) || !session_.dragSelection(paper)) {
         QWidget::mouseMoveEvent(event);
         return;
     }
-    session_.select(*dragAnchor_, interaction::clampFocus(session_.layout(), *dragAnchor_, paper));
+    // 普通移动交给父画布上报。拖选消费事件，由这里上报坐标。
+    emit canvas_.pointerMoved(paper);
     event->accept();
 }
 
 void EditorInput::mouseReleaseEvent(QMouseEvent* event)
 {
-    if (event->button() == Qt::LeftButton && dragAnchor_) {
-        dragAnchor_.reset();
+    if (event->button() == Qt::LeftButton && session_.endSelection()) {
         event->accept();
         return;
     }
@@ -161,12 +151,18 @@ void EditorInput::mouseReleaseEvent(QMouseEvent* event)
 
 void EditorInput::keyPressEvent(QKeyEvent* event)
 {
-    QString clipboardText;
-    if (event->matches(QKeySequence::Paste))
-        clipboardText = QGuiApplication::clipboard()->text();
+    // 如果按键直接送到画布，仍调用菜单使用的 QAction。
+    const QKeySequence shortcut(event->keyCombination());
+    for (auto* action : actions()) {
+        if (action->shortcuts().contains(shortcut)) {
+            action->trigger();
+            event->accept();
+            return;
+        }
+    }
     if (event->key() == Qt::Key_Escape && !session_.state().preedit.text.isEmpty())
         QGuiApplication::inputMethod()->reset();
-    session_.key({event->key(), event->modifiers(), event->text()}, clipboardText);
+    session_.key({event->key(), event->modifiers(), event->text()}, {});
     event->accept();
 }
 
@@ -223,7 +219,7 @@ void EditorInput::focusInEvent(QFocusEvent* event)
 
 void EditorInput::focusOutEvent(QFocusEvent* event)
 {
-    dragAnchor_.reset();
+    session_.endSelection();
     if (!session_.state().preedit.text.isEmpty()) {
         interaction::EditAction cancel;
         cancel.kind = interaction::EditActionKind::CancelPreedit;

@@ -39,6 +39,15 @@ T* requiredChild(const QObject& owner, const QString& name = {})
     return child;
 }
 
+template<class Sender, class Signal>
+void disconnectPlaceholder(Sender* sender, Signal signal, MainWindow& window, const char* slot)
+{
+    const auto& metaObject = MainWindow::staticMetaObject;
+    const int index = metaObject.indexOfSlot(slot);
+    if (index >= 0)
+        QObject::disconnect(sender, QMetaMethod::fromSignal(signal), &window, metaObject.method(index));
+}
+
 } // namespace
 
 EditorIntegration::EditorIntegration(MainWindow& window) : QObject(&window), window_(window)
@@ -93,20 +102,20 @@ EditorIntegration::~EditorIntegration()
 void EditorIntegration::bindActions()
 {
     const auto action = [this](const QString& name) { return requiredChild<QAction>(window_, name); };
-    // 只接管已有占位槽和缩放动作，其余信号连接交给原主窗口。
-    const auto bind = [this](auto* sender, auto signal, auto handler) {
-        disconnect(sender, QMetaMethod::fromSignal(signal), &window_, QMetaMethod{});
+    const auto bind = [this](auto* sender, auto signal, const char* slot, auto handler) {
+        disconnectPlaceholder(sender, signal, window_, slot);
         connect(sender, signal, this, handler);
     };
 
-    bind(action(QStringLiteral("actionNew")), &QAction::triggered, [this] {
+    bind(action(QStringLiteral("actionNew")), &QAction::triggered, "newDocument()", [this] {
         QGuiApplication::inputMethod()->reset();
         if (session_.newDocument())
             window_.statusBar()->showMessage(QStringLiteral("已新建文档"), 3000);
         input_->setFocus();
     });
-    bind(action(QStringLiteral("actionExportWord")), &QAction::triggered, &EditorIntegration::exportWord);
+    bind(action(QStringLiteral("actionExportWord")), &QAction::triggered, "exportWord()", &EditorIntegration::exportWord);
     auto* selectAll = action(QStringLiteral("actionSelectAll"));
+    input_->addAction(selectAll);
     connect(selectAll, &QAction::triggered, this, [this] {
         interaction::EditAction request;
         request.kind = interaction::EditActionKind::SelectAll;
@@ -120,6 +129,7 @@ void EditorIntegration::bindActions()
         item->setObjectName(name);
         item->setShortcuts(shortcut);
         editMenu->insertAction(selectAll, item);
+        input_->addAction(item);
         connect(item, &QAction::triggered, this, [this, kind] {
             interaction::EditAction request;
             request.kind = kind;
@@ -137,17 +147,24 @@ void EditorIntegration::bindActions()
                        interaction::EditActionKind::Paste);
     editMenu->insertSeparator(selectAll);
 
-    bind(font_, &QFontComboBox::currentFontChanged, [this](const QFont& font) {
+    font_->setInsertPolicy(QComboBox::NoInsert);
+    disconnectPlaceholder(font_, &QFontComboBox::currentFontChanged, window_, "applyFontFamily(QFont)");
+    connect(font_, &QComboBox::activated, this, [this](int index) {
+        const auto family = font_->itemText(index);
+        if (family.isEmpty())
+            return;
+
         data::TextStyleOverride style;
-        style.fontFamily = font.family();
+        style.fontFamily = family;
         setCharStyle(style);
+        input_->setFocus();
     });
     connect(size_, &QDoubleSpinBox::valueChanged, this, [this](double points) {
         data::TextStyleOverride style;
         style.fontSizePt = points;
         setCharStyle(style);
     });
-    disconnect(paragraph_, QMetaMethod::fromSignal(&QComboBox::currentIndexChanged), &window_, QMetaMethod{});
+    disconnectPlaceholder(paragraph_, &QComboBox::currentIndexChanged, window_, "applyParagraphStyle(int)");
     connect(paragraph_, &QComboBox::activated, this, [this](int index) {
         setParagraphRole(paragraph_->itemData(index).toInt());
         input_->setFocus();
@@ -156,17 +173,18 @@ void EditorIntegration::bindActions()
     bold_ = action(QStringLiteral("actionBold"));
     italic_ = action(QStringLiteral("actionItalic"));
     underline_ = action(QStringLiteral("actionUnderline"));
-    const auto bindToggle = [&](QAction* toggle, std::optional<bool> data::TextStyleOverride::* field) {
-        bind(toggle, &QAction::triggered, [this, field](bool checked) {
+    const auto bindToggle = [&](QAction* toggle, const char* slot, std::optional<bool> data::TextStyleOverride::* field) {
+        input_->addAction(toggle);
+        bind(toggle, &QAction::triggered, slot, [this, field](bool checked) {
             data::TextStyleOverride style;
             style.*field = checked;
             setCharStyle(style);
             input_->setFocus();
         });
     };
-    bindToggle(bold_, &data::TextStyleOverride::bold);
-    bindToggle(italic_, &data::TextStyleOverride::italic);
-    bindToggle(underline_, &data::TextStyleOverride::underline);
+    bindToggle(bold_, "applyBold(bool)", &data::TextStyleOverride::bold);
+    bindToggle(italic_, "applyItalic(bool)", &data::TextStyleOverride::italic);
+    bindToggle(underline_, "applyUnderline(bool)", &data::TextStyleOverride::underline);
 
     auto* formatMenu = requiredChild<QMenu>(window_, QStringLiteral("menuFormat"));
     auto* insertMenu = new QMenu(QStringLiteral("插入(&I)"), &window_);
@@ -190,10 +208,16 @@ void EditorIntegration::bindActions()
         input_->setFocus();
     });
 
-    bind(action(QStringLiteral("actionZoomIn")), &QAction::triggered, [this] { setZoom(canvas_->zoom() * 1.1); });
-    bind(action(QStringLiteral("actionZoomOut")), &QAction::triggered, [this] { setZoom(canvas_->zoom() / 1.1); });
-    bind(action(QStringLiteral("actionZoomActual")), &QAction::triggered, [this] { setZoom(1); });
-    bind(action(QStringLiteral("actionFitWidth")), &QAction::triggered, [this] {
+    // MainWindow 用 lambda 连接缩放动作。接管后才能按当前滚动值恢复缩放锚点。
+    const auto bindZoom = [this, &action](const QString& name, auto handler) {
+        auto* item = action(name);
+        disconnect(item, QMetaMethod::fromSignal(&QAction::triggered), &window_, QMetaMethod{});
+        connect(item, &QAction::triggered, this, handler);
+    };
+    bindZoom(QStringLiteral("actionZoomIn"), [this] { setZoom(canvas_->zoom() * 1.1); });
+    bindZoom(QStringLiteral("actionZoomOut"), [this] { setZoom(canvas_->zoom() / 1.1); });
+    bindZoom(QStringLiteral("actionZoomActual"), [this] { setZoom(1); });
+    bindZoom(QStringLiteral("actionFitWidth"), [this] {
         setZoom(canvas_->zoomToFitWidth(scroll_->viewport()->width()));
     });
 }

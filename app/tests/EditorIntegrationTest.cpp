@@ -16,6 +16,7 @@
 #include <QFontComboBox>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLineEdit>
 #include <QMouseEvent>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -135,6 +136,10 @@ void testEditing(MainWindow& window, app::EditorSession& session, QWidget& input
 
     action(window, "actionSelectAll").trigger();
     action(window, "actionBold").trigger();
+    sendKey(input, Qt::Key_B, Qt::ControlModifier);
+    check(!session.currentStyle().bold, "Ctrl+B must turn off bold applied by the menu");
+    sendKey(input, Qt::Key_B, Qt::ControlModifier);
+    check(session.currentStyle().bold, "Ctrl+B must turn bold back on");
     auto* size = window.findChild<QDoubleSpinBox*>();
     check(size != nullptr, "Missing the original font size control");
     size->setValue(15);
@@ -235,6 +240,46 @@ void testInsertImages(MainWindow& window, app::EditorSession& session, QWidget& 
           && revision == session.snapshot().revision, "A failed import changed the document");
 }
 
+void testFontSelection(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    auto* font = window.findChild<QFontComboBox*>();
+    check(font && font->lineEdit(), "Missing the editable font selector");
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("ABC"));
+    action(window, "actionSelectAll").trigger();
+
+    const auto revision = session.snapshot().revision;
+    const auto unknownFamily = QStringLiteral("Unknown Editor Font");
+    font->setEditText(unknownFamily);
+    sendKey(*font->lineEdit(), Qt::Key_Return);
+    check(session.snapshot().revision == revision && font->findText(unknownFamily) == -1,
+          "An unknown font must not change the document or be added to the list");
+
+    const int courier = font->findText(QStringLiteral("Courier New"));
+    const int arial = font->findText(QStringLiteral("Arial"));
+    // The offscreen font database may not provide the Windows fonts.
+    if (courier >= 0 && arial >= 0) {
+        font->setFocus();
+        font->setEditText(font->itemText(courier));
+        check(session.snapshot().revision == revision, "Typing a font name must not change the document");
+        sendKey(*font->lineEdit(), Qt::Key_Return);
+        check(currentText(session).formatSpans.size() == 1 &&
+              currentText(session).formatSpans.front().style.fontFamily == font->itemText(courier),
+              "Confirming a font name must apply it to the selected text");
+
+        sendKey(input, Qt::Key_End);
+        font->setFocus();
+        font->setCurrentIndex(arial);
+        font->activated(arial);
+        check(window.focusWidget() == &input, "Font confirmation must return focus to the editor");
+        sendKey(input, Qt::Key_unknown, {}, QStringLiteral("Z"));
+        check(currentText(session).text == QStringLiteral("ABCZ") &&
+              currentText(session).formatSpans.size() == 2 &&
+              currentText(session).formatSpans.back().style.fontFamily == font->itemText(arial),
+              "Text entered after choosing a font must use that font");
+    }
+    check(session.newDocument(), "Could not reset the document after the font test");
+}
+
 void testIme(app::EditorSession& session, QWidget& input)
 {
     sendKey(input, Qt::Key_unknown, {}, QStringLiteral("ab"));
@@ -292,12 +337,27 @@ void testRealLayouts(MainWindow& window, app::EditorSession& session, QWidget& i
         check(left != fragments.end() && right != fragments.end(), "Missing wrap fragments on either side of an image");
         const auto startPoint = canvas->paperToWidget(left->rect.center());
         const auto endPoint = canvas->paperToWidget(right->rect.center());
+        int pointerUpdates = 0;
+        const auto pointerConnection = QObject::connect(canvas, &CanvasWidget::pointerMoved, &window,
+            [&pointerUpdates] { ++pointerUpdates; });
+        sendMouse(input, QEvent::MouseMove, startPoint, Qt::NoButton, Qt::NoButton);
+        QObject::disconnect(pointerConnection);
+        check(pointerUpdates == 1, "Moving the mouse should update the paper coordinates once");
+
         sendMouse(input, QEvent::MouseButtonPress, startPoint, Qt::LeftButton, Qt::LeftButton);
         sendMouse(input, QEvent::MouseMove, endPoint, Qt::NoButton, Qt::LeftButton);
         sendMouse(input, QEvent::MouseButtonRelease, endPoint, Qt::LeftButton, Qt::NoButton);
         check(session.state().caret.containerId == QStringLiteral("body") &&
               session.state().selection && session.state().selection->rects.size() >= 2,
               "Dragging across the image did not select one source text range");
+        sendMouse(input, QEvent::MouseButtonPress, endPoint, Qt::LeftButton, Qt::LeftButton);
+        const int anchor = session.state().caret.offset;
+        sendMouse(input, QEvent::MouseMove, startPoint, Qt::NoButton, Qt::LeftButton);
+        sendMouse(input, QEvent::MouseButtonRelease, startPoint, Qt::LeftButton, Qt::NoButton);
+        const int dragEnd = session.state().caret.offset;
+        sendKey(input, Qt::Key_Right, Qt::ShiftModifier);
+        check(session.state().selectionAnchor == anchor && session.state().caret.offset > dragEnd,
+              "Shift+Right lost the anchor after a reverse drag");
         const auto path = output.filePath(QStringLiteral("wrapped-%1.docx").arg(QString::fromLatin1(id)));
         check(session.exportTo(path).ok() && readDocumentXml(path).contains("<wp:wrapSquare"),
               "Export did not keep the image wrap");
@@ -350,6 +410,7 @@ int main(int argc, char** argv)
     check(output.isValid(), "Could not create a temporary directory for DOCX files");
     auto& session = integration.session();
     testEditing(window, session, *input, output);
+    testFontSelection(window, session, *input);
     testIme(session, *input);
     testRejectedBatch();
     testInsertImages(window, session, *input, output);
