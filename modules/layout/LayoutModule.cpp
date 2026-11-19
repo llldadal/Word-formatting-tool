@@ -2,6 +2,7 @@
 #include <QTextCharFormat>
 #include <QFont>
 #include <QTextOption>
+#include <cmath>
 #include <memory>
 
 namespace editor::layout {
@@ -22,6 +23,27 @@ static data::TextStyle mergeTextStyle(
     if (change.underline.has_value())
         base.underline = *change.underline;
     return base;
+}
+
+data::TextStyle resolveParagraphStyle(data::TextStyle base, const data::ParagraphInfo& paragraph)
+{
+    switch (paragraph.role)
+    {
+    case data::ParagraphRole::Body:
+        break;
+    case data::ParagraphRole::Title:
+        base.fontSizePt = 19.5;
+        base.bold = true;
+        break;
+    case data::ParagraphRole::Heading:
+    {
+        static constexpr qreal sizes[] = {18, 16.5, 15, 14, 13, 12, 12, 12, 12};
+        base.fontSizePt = sizes[qBound(1, paragraph.headingLevel, 9) - 1];
+        base.bold = true;
+        break;
+    }
+    }
+    return mergeTextStyle(base, paragraph.defaultStyle);
 }
 
 static QTextCharFormat makeCharFormat(const data::TextStyle& style)
@@ -69,6 +91,23 @@ static std::vector<QRectF> availableTextAreas(
     return areas;
 }
 
+static qreal obstacleBandHeight(QTextLayout& layout, qreal width, qreal minimumHeight)
+{
+    // 先用实际排字结果估计绕排带的上限，包含局部大字号和 Qt 选用的回退字体。
+    // 两侧片段尚未排出时，按这个高度找空隙，防止较高的文字从图片上方穿进去。
+    qreal ascent = 0;
+    qreal descent = 0;
+    layout.beginLayout();
+    for (auto line = layout.createLine(); line.isValid(); line = layout.createLine())
+    {
+        line.setLineWidth(width);
+        ascent = qMax(ascent, line.ascent());
+        descent = qMax(descent, line.descent());
+    }
+    layout.endLayout();
+    return qMax(minimumHeight, std::ceil(ascent + descent));
+}
+
 static qreal layoutText(
     const data::ContainerNode& node,
     const QRectF& contentRect,
@@ -87,8 +126,7 @@ static qreal layoutText(
         const auto& format = paragraph.format;
         lineY += format.spaceBefore;
 
-        const auto baseStyle = mergeTextStyle(
-            node.text.defaultStyle, paragraph.defaultStyle);
+        const auto baseStyle = resolveParagraphStyle(node.text.defaultStyle, paragraph);
         const auto baseFormat = makeCharFormat(baseStyle);
         auto layout = std::make_shared<QTextLayout>(
             node.text.text.mid(range.start, range.end - range.start),
@@ -134,6 +172,9 @@ static qreal layoutText(
 
         layout->setFormats(formats);
 
+        const qreal wrapBandHeight = obstacles.empty()
+            ? format.lineHeight
+            : obstacleBandHeight(*layout, contentRect.width(), format.lineHeight);
         const int layoutIndex = static_cast<int>(result.textLayouts.size());
         int lineIndex = 0;
         layout->beginLayout();
@@ -148,11 +189,12 @@ static qreal layoutText(
             // 缩进用尽整行时，借用未缩进的宽度，避免生成零宽片段。
             const QRectF lineArea(
                 contentRect.left() + (lineWidth > 0 ? indent : 0), lineY,
-                lineWidth > 0 ? lineWidth : contentRect.width(), format.lineHeight);
+                lineWidth > 0 ? lineWidth : contentRect.width(), wrapBandHeight);
             const auto areas = availableTextAreas(lineArea, obstacles);
             const bool obstructed = areas.size() != 1 || areas.front() != lineArea;
 
-            const int firstLineOnRow = lineIndex;
+            const auto firstFragmentOnRow = result.textFragments.size();
+            qreal rowHeight = format.lineHeight;
             for (const auto& area : areas)
             {
                 if (!pendingLine.isValid())
@@ -175,7 +217,7 @@ static qreal layoutText(
                 result.textFragments.push_back({
                     node.id, {start, end}, area, layoutIndex, lineIndex
                 });
-                result.layoutBounds = result.layoutBounds.united(area);
+                rowHeight = qMax(rowHeight, pendingLine.height());
                 ++lineIndex;
                 pendingLine = QTextLine();
 
@@ -186,8 +228,14 @@ static qreal layoutText(
                 }
             }
 
-            if (!finished || lineIndex != firstLineOnRow)
-                lineY += format.lineHeight;
+            for (auto i = firstFragmentOnRow; i < result.textFragments.size(); ++i)
+            {
+                auto& rect = result.textFragments[i].rect;
+                rect.setHeight(rowHeight);
+                result.layoutBounds = result.layoutBounds.united(rect);
+            }
+            if (!finished || firstFragmentOnRow != result.textFragments.size())
+                lineY += rowHeight;
         }
         layout->endLayout();
         result.textLayouts.push_back(layout);

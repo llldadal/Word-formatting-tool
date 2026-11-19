@@ -81,7 +81,7 @@ struct ParagraphFormat {
     qreal leftIndent = 0;                                    // 左侧缩进。
     qreal rightIndent = 0;                                   // 右侧缩进。
     qreal firstLineIndent = 0;                               // 在左缩进基础上的首行缩进。
-    qreal lineHeight = 26;                                   // 固定行高。
+    qreal lineHeight = 26;                                   // 编辑器排版的最小行高。
     qreal spaceBefore = 0;                                  // 段落之前的间距。
     qreal spaceAfter = 0;                                   // 段落之后的间距。
 };
@@ -96,7 +96,7 @@ struct ParagraphInfo {
 };
 
 // 一个文本容器只有一份连续文本，段落和格式区间都引用它的 UTF-16 位置。
-// 字符格式按容器默认、段落默认、局部区间的顺序覆盖。
+// 编辑器字符格式按容器默认、段落角色、段落默认、局部区间的顺序覆盖。
 struct TextContent {
     QString text;                          // 完整正文，段落之间使用 '\n' 分隔。
     TextStyle defaultStyle;                // 容器默认字符格式。

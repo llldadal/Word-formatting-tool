@@ -106,6 +106,74 @@ void chooseFile(MainWindow& window, const QString& path)
     });
 }
 
+void testParagraphLayout(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("AB"));
+    sendKey(input, Qt::Key_Return);
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("CD"));
+    sendKey(input, Qt::Key_Home, Qt::ControlModifier);
+
+    const auto combos = window.findChild<QToolBar*>(QStringLiteral("mainToolBar"))->findChildren<QComboBox*>();
+    const auto role = std::find_if(combos.begin(), combos.end(), [](QComboBox* combo) {
+        return combo->findData(-1) >= 0 && combo->findData(2) >= 0;
+    });
+    check(role != combos.end(), "Missing the paragraph style control");
+    auto* size = window.findChild<QDoubleSpinBox*>();
+    check(size != nullptr, "Missing the font size control");
+    const auto font = [&] { return session.layout().textLayouts.front()->font(); };
+    const int bodyPixels = font().pixelSize();
+    const qreal bodyHeight = session.layout().textFragments.front().rect.height();
+
+    (*role)->activated((*role)->findData(-1));
+    const int titlePixels = font().pixelSize();
+    check(titlePixels > bodyPixels && font().bold() && size->value() > 12,
+          "The Title toolbar option did not change the laid-out text and displayed font size");
+    (*role)->activated((*role)->findData(1));
+    const int heading1Pixels = font().pixelSize();
+    (*role)->activated((*role)->findData(2));
+    check(titlePixels > heading1Pixels && heading1Pixels > font().pixelSize() &&
+          font().pixelSize() > bodyPixels && font().bold(), "Heading levels did not change the laid-out text");
+    (*role)->activated((*role)->findData(0));
+    check(font().pixelSize() == bodyPixels && !font().bold() && size->value() == 12,
+          "Restoring Body did not restore the inherited font");
+
+    sendKey(input, Qt::Key_Right, Qt::ShiftModifier);
+    size->setValue(72);
+    const auto& layout = session.layout();
+    check(layout.textFragments.size() == 2, "Expected two lines of text");
+    const auto& large = layout.textFragments.front();
+    const auto& normal = layout.textFragments.back();
+    const auto largeLine = layout.textLayouts[large.layoutIndex]->lineAt(large.lineIndex);
+    check(largeLine.height() > bodyHeight && large.rect.height() >= largeLine.height() &&
+          normal.rect.height() == bodyHeight && normal.rect.top() >= large.rect.bottom(),
+          "A large font must expand its line without clipping, overlapping or expanding the next line");
+
+    auto wrapCase = editor::testing::makeLayoutCase(QStringLiteral("02"));
+    auto& body = wrapCase.document.root.children.back();
+    data::TextFormatSpan largeCharacter;
+    largeCharacter.range = {0, 1};
+    largeCharacter.style.fontSizePt = 72;
+    body.text.formatSpans.push_back(largeCharacter);
+    check(session.loadSnapshot(wrapCase.document), "Could not load the large text wrap case");
+    const auto& wrapped = session.layout();
+    const auto picture = std::find_if(wrapped.containers.begin(), wrapped.containers.end(), [](const auto& box) {
+        return box.containerId == QStringLiteral("photo1");
+    });
+    check(picture != wrapped.containers.end(), "Missing the floating image box");
+    bool tallRowReachedImage = false;
+    for (const auto& fragment : wrapped.textFragments) {
+        if (fragment.containerId != body.id)
+            continue;
+        check(!fragment.rect.intersects(picture->outerRect), "The expanded text row overlaps the floating image");
+        if (fragment.sourceRange.start == 0)
+            tallRowReachedImage = fragment.rect.top() < picture->outerRect.top() &&
+                                  fragment.rect.bottom() > picture->outerRect.top();
+    }
+    check(tallRowReachedImage, "The first large character must wrap beside the image that starts below it");
+
+    check(session.newDocument(), "Could not reset the document after testing paragraph layout");
+}
+
 void testEditing(MainWindow& window, app::EditorSession& session, QWidget& input, const QTemporaryDir& output)
 {
     const auto firstId = session.state().caret.containerId;
@@ -349,6 +417,7 @@ int main(int argc, char** argv)
     const QTemporaryDir output(QApplication::applicationDirPath() + QStringLiteral("/editor-test-XXXXXX"));
     check(output.isValid(), "Could not create a temporary directory for DOCX files");
     auto& session = integration.session();
+    testParagraphLayout(window, session, *input);
     testEditing(window, session, *input, output);
     testIme(session, *input);
     testRejectedBatch();
