@@ -139,6 +139,7 @@ void EditorSession::startDocument(document::Document document, const data::Conta
 {
     setLayoutSnapshot(document.toSnapshot());
     state_ = interaction::makeInitialState(snapshot_, layout_, textId);
+    dragAnchor_.reset();
     document_ = std::move(document);
     importedImages_.clear();
     emit changed(true);
@@ -263,11 +264,41 @@ void EditorSession::select(const interaction::Hit& anchor, const interaction::Hi
     const int end = interaction::alignToGrapheme(content->text, focus.offset);
     auto state = interaction::makeInitialState(snapshot_, layout_, focus.containerId, end);
     if (start != end) {
-        state.selection = interaction::makeSelection(layout_, focus.containerId, {start, end});
+        state.selection = interaction::makeSelection(layout_, {anchor.containerId, start},
+                                                    {focus.containerId, end});
         state.selectionAnchor = start;
     }
     state_ = std::move(state);
     emit changed(false);
+}
+
+bool EditorSession::beginSelection(QPointF paperPoint, bool extendSelection)
+{
+    const auto hit = interaction::hitTest(layout_, paperPoint);
+    if (!hit.valid())
+        return false;
+
+    dragAnchor_ = hit;
+    if (extendSelection) {
+        dragAnchor_ = interaction::Hit{state_.caret.containerId,
+                                      state_.selectionAnchor.value_or(state_.caret.offset)};
+        return dragSelection(paperPoint);
+    }
+    select(hit, hit);
+    return true;
+}
+
+bool EditorSession::dragSelection(QPointF paperPoint)
+{
+    if (!dragAnchor_)
+        return false;
+    select(*dragAnchor_, interaction::clampFocus(layout_, *dragAnchor_, paperPoint));
+    return true;
+}
+
+bool EditorSession::endSelection()
+{
+    return std::exchange(dragAnchor_, std::nullopt).has_value();
 }
 
 bool EditorSession::key(const interaction::KeyInput& key, const QString& clipboardText)
@@ -319,7 +350,8 @@ bool EditorSession::accept(interaction::InteractionOutput output)
                 document_ = std::move(*staged);
         }
     }
-    state_ = interaction::refreshStateGeometry(output.state, layout_);
+    state_ = layoutChanged ? interaction::refreshStateGeometry(output.state, layout_)
+                           : std::move(output.state);
     emit changed(layoutChanged);
     if (output.clipboardText)
         emit clipboardRequested(*output.clipboardText);
