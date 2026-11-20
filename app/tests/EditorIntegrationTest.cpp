@@ -174,6 +174,74 @@ void testParagraphLayout(MainWindow& window, app::EditorSession& session, QWidge
     check(session.newDocument(), "Could not reset the document after testing paragraph layout");
 }
 
+void testWrapUsesCurrentRowHeight(app::EditorSession& session)
+{
+    auto doc = editor::testing::makeLayoutCase(QStringLiteral("02")).document;
+    auto body = doc.root.children.back();
+    auto picture = body.children.front();
+    // The line separator starts a new visual row inside the same paragraph.
+    body.children.clear();
+    body.text.text = QStringLiteral("small\u2028BIG");
+    data::ParagraphInfo paragraph;
+    paragraph.range = {0, int(body.text.text.size())};
+    body.text.paragraphs = {paragraph};
+    body.text.formatSpans = {{{6, paragraph.range.end}, {}}};
+    body.text.formatSpans.front().style.fontSizePt = 48;
+    doc.root.children = {body};
+    check(session.loadSnapshot(doc), "Could not load the mixed-height paragraph");
+    check(session.layout().textFragments.size() == 2, "Expected two rows in a single paragraph");
+    const QRectF firstRow = session.layout().textFragments.front().rect;
+    const qreal secondHeight = session.layout().textFragments.back().rect.height();
+    check(secondHeight > firstRow.height() + 1, "Expected the later row to be taller");
+
+    picture.geometry.position = QPointF(0, firstRow.height() + 1);
+    picture.geometry.margin = {};
+    picture.geometry.padding = {};
+    picture.image.displaySize = QSizeF(firstRow.width(), 32);
+    doc.root.children.front().children.push_back(picture);
+    check(session.loadSnapshot(doc), "Could not add a full-width image below the small row");
+    const auto& wrapped = session.layout();
+    check(wrapped.images.size() == 1 && wrapped.textFragments.size() == 2, "Expected one image and two text rows");
+    check(wrapped.textFragments.front().rect == firstRow,
+          "A tall later row must not make an earlier small row avoid the image");
+    check(wrapped.textFragments.back().rect.top() >= wrapped.images.front().rect.bottom(),
+          "The tall row must still avoid the image");
+    check(wrapped.textFragments.front().sourceRange.end == wrapped.textFragments.back().sourceRange.start &&
+          wrapped.textFragments.back().sourceRange.end == paragraph.range.end,
+          "Retrying a blocked row lost or repeated text");
+
+    // The second image appears only after the tall row grows, so the existing
+    // left and right fragments need to be measured again as a single row.
+    const qreal width = firstRow.width();
+    picture.geometry.position = QPointF(width / 3, firstRow.height());
+    picture.image.displaySize = QSizeF(width / 8, 42);
+    auto lowerImage = picture;
+    lowerImage.id = QStringLiteral("photo-lower");
+    lowerImage.geometry.position = QPointF(width * 2 / 3, firstRow.height() + 32);
+    auto& retryBody = doc.root.children.front();
+    retryBody.children = {picture, lowerImage};
+    retryBody.text.text = QStringLiteral("small\u2028W ") + QStringLiteral("word ").repeated(40);
+    retryBody.text.paragraphs.front().range.end = int(retryBody.text.text.size());
+    retryBody.text.formatSpans.front().range = {6, 7};
+    check(session.loadSnapshot(doc), "Could not load the split-row retry case");
+    const auto& split = session.layout();
+    check(split.images.size() == 2 && split.textFragments.front().rect == firstRow,
+          "The preceding row must stay intact when a split row is retried");
+    int next = 0;
+    int tallFragments = 0;
+    for (const auto& fragment : split.textFragments) {
+        check(fragment.sourceRange.start == next, "Retrying multiple row fragments lost or repeated text");
+        next = fragment.sourceRange.end;
+        if (fragment.rect.top() == firstRow.bottom() && fragment.rect.height() > 32)
+            ++tallFragments;
+        for (const auto& entry : split.images)
+            check(!fragment.rect.intersects(entry.rect), "A retried fragment overlaps one of its obstacles");
+    }
+    check(tallFragments >= 2 && next == retryBody.text.text.size(),
+          "The tall row should still wrap around both images");
+    check(session.newDocument(), "Could not reset after the wrap height test");
+}
+
 void testEditing(MainWindow& window, app::EditorSession& session, QWidget& input, const QTemporaryDir& output)
 {
     const auto firstId = session.state().caret.containerId;
@@ -418,6 +486,7 @@ int main(int argc, char** argv)
     check(output.isValid(), "Could not create a temporary directory for DOCX files");
     auto& session = integration.session();
     testParagraphLayout(window, session, *input);
+    testWrapUsesCurrentRowHeight(session);
     testEditing(window, session, *input, output);
     testIme(session, *input);
     testRejectedBatch();

@@ -2,8 +2,9 @@
 #include <QTextCharFormat>
 #include <QFont>
 #include <QTextOption>
-#include <cmath>
+#include <algorithm>
 #include <memory>
+#include <utility>
 
 namespace editor::layout {
 
@@ -91,21 +92,76 @@ static std::vector<QRectF> availableTextAreas(
     return areas;
 }
 
-static qreal obstacleBandHeight(QTextLayout& layout, qreal width, qreal minimumHeight)
+struct DraftFragment
 {
-    // 先用实际排字结果估计绕排带的上限，包含局部大字号和 Qt 选用的回退字体。
-    // 两侧片段尚未排出时，按这个高度找空隙，防止较高的文字从图片上方穿进去。
-    qreal ascent = 0;
-    qreal descent = 0;
-    layout.beginLayout();
-    for (auto line = layout.createLine(); line.isValid(); line = layout.createLine())
+    QTextLine line;
+    QRectF area;
+};
+
+struct DraftRow
+{
+    std::vector<DraftFragment> fragments;
+    qreal height;
+    bool finished = false;
+};
+
+static DraftRow fitRow(QTextLayout& layout, QTextLine& pendingLine,
+                       const QRectF& band, const std::vector<QRectF>& areas, qreal minimumHeight)
+{
+    DraftRow row{{}, minimumHeight};
+    const bool obstructed = areas.size() != 1 || areas.front() != band;
+    const auto textLength = layout.text().size();
+    for (const auto& area : areas)
     {
-        line.setLineWidth(width);
-        ascent = qMax(ascent, line.ascent());
-        descent = qMax(descent, line.descent());
+        if (!pendingLine.isValid())
+            pendingLine = layout.createLine();
+        if (!pendingLine.isValid())
+        {
+            row.finished = true;
+            break;
+        }
+
+        pendingLine.setLineWidth(area.width());
+        // Qt 会在空行接收超宽的首字形。遇到图片时先保留原文起点，换个空隙重试。
+        if (obstructed && pendingLine.naturalTextWidth() > area.width())
+            continue;
+        row.fragments.push_back({pendingLine, area});
+        row.height = qMax(row.height, pendingLine.height());
+        row.finished = pendingLine.textStart() + pendingLine.textLength() >= textLength;
+        pendingLine = {};
+        if (row.finished)
+            break;
     }
+    return row;
+}
+
+static bool sameHorizontalAreas(const std::vector<QRectF>& first, const std::vector<QRectF>& second)
+{
+    return std::equal(first.begin(), first.end(), second.begin(), second.end(),
+        [](const QRectF& a, const QRectF& b) { return a.x() == b.x() && a.width() == b.width(); });
+}
+
+static void retryRow(QTextLayout& layout, QTextLine& pendingLine, const DraftRow& row,
+                     const data::LayoutResult& result, std::size_t firstParagraphFragment)
+{
+    if (row.fragments.size() == 1 && !pendingLine.isValid())
+    {
+        // 尚未创建下一条 Qt 行，可以直接用新宽度重排这一条。
+        pendingLine = row.fragments.front().line;
+        return;
+    }
+
+    // 一行可能绕图拆成多条 Qt 行。撤回整行，恢复本段已经确认的片段。
     layout.endLayout();
-    return qMax(minimumHeight, std::ceil(ascent + descent));
+    layout.beginLayout();
+    pendingLine = {};
+    for (auto i = firstParagraphFragment; i < result.textFragments.size(); ++i)
+    {
+        const auto& rect = result.textFragments[i].rect;
+        auto line = layout.createLine();
+        line.setLineWidth(rect.width());
+        line.setPosition(rect.topLeft());
+    }
 }
 
 static qreal layoutText(
@@ -172,70 +228,52 @@ static qreal layoutText(
 
         layout->setFormats(formats);
 
-        const qreal wrapBandHeight = obstacles.empty()
-            ? format.lineHeight
-            : obstacleBandHeight(*layout, contentRect.width(), format.lineHeight);
         const int layoutIndex = static_cast<int>(result.textLayouts.size());
-        int lineIndex = 0;
+        const auto firstParagraphFragment = result.textFragments.size();
         layout->beginLayout();
 
         QTextLine pendingLine;
         bool finished = false;
         while (!finished)
         {
+            const bool firstRow = result.textFragments.size() == firstParagraphFragment;
             const qreal indent = format.leftIndent
-                                 + (lineIndex == 0 ? format.firstLineIndent : 0);
+                                 + (firstRow ? format.firstLineIndent : 0);
             const qreal lineWidth = contentRect.width() - indent - format.rightIndent;
             // 缩进用尽整行时，借用未缩进的宽度，避免生成零宽片段。
-            const QRectF lineArea(
+            QRectF band(
                 contentRect.left() + (lineWidth > 0 ? indent : 0), lineY,
-                lineWidth > 0 ? lineWidth : contentRect.width(), wrapBandHeight);
-            const auto areas = availableTextAreas(lineArea, obstacles);
-            const bool obstructed = areas.size() != 1 || areas.front() != lineArea;
+                lineWidth > 0 ? lineWidth : contentRect.width(), format.lineHeight);
+            auto areas = availableTextAreas(band, obstacles);
+            auto row = fitRow(*layout, pendingLine, band, areas, format.lineHeight);
 
-            const auto firstFragmentOnRow = result.textFragments.size();
-            qreal rowHeight = format.lineHeight;
-            for (const auto& area : areas)
+            // 仅当本行变高后会碰到新的障碍时才重排。重试只增加探测高度，
+            // 避免边缘的大字在加入和移出本行之间反复改变可用宽度。
+            while (!obstacles.empty() && row.height > band.height())
             {
-                if (!pendingLine.isValid())
-                    pendingLine = layout->createLine();
-                if (!pendingLine.isValid())
-                {
-                    finished = true;
+                band.setHeight(row.height);
+                auto reduced = availableTextAreas(band, obstacles);
+                if (sameHorizontalAreas(areas, reduced))
                     break;
-                }
-
-                pendingLine.setLineWidth(area.width());
-                // Qt 允许空行接收超宽文字。绕排时保留原文起点，换个空隙重试。
-                // 整行都可用时允许单个放不下的字形组溢出，保证排版继续。
-                if (obstructed && pendingLine.naturalTextWidth() > area.width())
-                    continue;
-                pendingLine.setPosition(area.topLeft());
-
-                const int start = range.start + pendingLine.textStart();
-                const int end = start + pendingLine.textLength();
-                result.textFragments.push_back({
-                    node.id, {start, end}, area, layoutIndex, lineIndex
-                });
-                rowHeight = qMax(rowHeight, pendingLine.height());
-                ++lineIndex;
-                pendingLine = QTextLine();
-
-                if (end >= range.end)
-                {
-                    finished = true;
-                    break;
-                }
+                retryRow(*layout, pendingLine, row, result, firstParagraphFragment);
+                areas = std::move(reduced);
+                row = fitRow(*layout, pendingLine, band, areas, format.lineHeight);
             }
 
-            for (auto i = firstFragmentOnRow; i < result.textFragments.size(); ++i)
+            for (auto& fragment : row.fragments)
             {
-                auto& rect = result.textFragments[i].rect;
-                rect.setHeight(rowHeight);
+                auto rect = fragment.area;
+                rect.setHeight(row.height);
+                fragment.line.setPosition(rect.topLeft());
+                const int start = range.start + fragment.line.textStart();
+                result.textFragments.push_back({
+                    node.id, {start, start + fragment.line.textLength()}, rect, layoutIndex, fragment.line.lineNumber()
+                });
                 result.layoutBounds = result.layoutBounds.united(rect);
             }
-            if (!finished || firstFragmentOnRow != result.textFragments.size())
-                lineY += rowHeight;
+            finished = row.finished;
+            if (!finished || !row.fragments.empty())
+                lineY += row.height;
         }
         layout->endLayout();
         result.textLayouts.push_back(layout);
