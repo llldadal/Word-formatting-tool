@@ -620,8 +620,10 @@ static void testToolbarFormatting()
                   && r.charStyle.bold.has_value() && r.charStyle.bold.value(),
               QStringLiteral("bold request targets [46,60) with bold=true"));
     }
-    check(bolded.state.selection.has_value() && !bolded.state.pendingCharStyle.has_value(),
-          QStringLiteral("selected format keeps selection and clears pending style"));
+    check(bolded.state.selection.has_value() && bolded.state.pendingCharStyle.has_value()
+              && bolded.state.pendingCharStyle->bold.has_value()
+              && bolded.state.pendingCharStyle->bold.value(),
+          QStringLiteral("selected format keeps selection and stores style for following input"));
 
     auto shortcut = ei::applyKey(selected, makeKey(Qt::Key_B, Qt::ControlModifier),
                                  doc, layout);
@@ -665,8 +667,32 @@ static void testToolbarFormatting()
                   && second.charStyle.italic.has_value(),
               QStringLiteral("second request applies pending style to inserted range"));
     }
-    check(!inserted.state.pendingCharStyle.has_value(),
-          QStringLiteral("pending style is consumed after insertion"));
+    // 折叠光标连续输入时，待用格式必须在后续字符上继续生效。
+    check(inserted.state.pendingCharStyle.has_value(),
+          QStringLiteral("pending style is kept after insertion for following characters"));
+
+    auto insertedNext = ei::applyKey(inserted.state,
+                                     makeKey(0, Qt::NoModifier, QStringLiteral("Y")),
+                                     doc, layout);
+    check(insertedNext.requests.size() == 2,
+          QStringLiteral("second consecutive character still emits Insert then SetCharFormat"));
+    if (insertedNext.requests.size() == 2) {
+        const auto& formatReq = insertedNext.requests[1];
+        check(formatReq.op == ei::EditOp::SetCharFormat
+                  && formatReq.range.start == 11 && formatReq.range.end == 12
+                  && formatReq.charStyle.bold.has_value()
+                  && formatReq.charStyle.italic.has_value(),
+              QStringLiteral("second character keeps pending bold+italic style"));
+    }
+
+    // 带着待用格式去替换选区时，格式仍要保留：替换不是"修改格式"，
+    // 后续输入应继续沿用同一个格式。
+    ei::InteractionState pendingWithSelection = selected;
+    pendingWithSelection.pendingCharStyle = bold;
+    auto replaced = ei::applyPaste(pendingWithSelection, QStringLiteral("W"), doc, layout);
+    check(replaced.state.pendingCharStyle.has_value()
+              && replaced.state.pendingCharStyle->bold.has_value(),
+          QStringLiteral("replacing a selection keeps pending style"));
 
     ed::ParagraphFormat paragraphFormat;
     paragraphFormat.alignment = ed::ParagraphAlignment::Center;
@@ -782,7 +808,8 @@ static void testInteractionRegressions()
     check(!emptyCopy.clipboardText.has_value(),
           QStringLiteral("Ctrl+C without a selection leaves the clipboard untouched"));
 
-    // 光标一移动或删除，折叠光标处设的待用格式就该失效。
+    // 待用格式一旦设下就一直保持，直到用户再次主动修改；移动光标、删除只是
+    // 编辑内容，不应让格式失效（点击回退属集成层状态重建，不在这里测）。
     ed::TextStyleOverride bold;
     bold.bold = true;
     auto pending = ei::applyCharFormat(ei::makeInitialState(doc, layout, body, 10),
@@ -790,11 +817,26 @@ static void testInteractionRegressions()
     check(pending.state.pendingCharStyle.has_value(),
           QStringLiteral("pending style is set before the caret moves"));
     auto moved = ei::applyKey(pending.state, makeKey(Qt::Key_Right), doc, layout);
-    check(!moved.state.pendingCharStyle.has_value(),
-          QStringLiteral("moving the caret invalidates the pending character style"));
+    check(moved.state.pendingCharStyle.has_value()
+              && moved.state.pendingCharStyle->bold.value_or(false),
+          QStringLiteral("moving the caret keeps the pending character style"));
     auto deleted = ei::applyKey(pending.state, makeKey(Qt::Key_Backspace), doc, layout);
-    check(!deleted.state.pendingCharStyle.has_value(),
-          QStringLiteral("deleting invalidates the pending character style"));
+    check(deleted.state.pendingCharStyle.has_value()
+              && deleted.state.pendingCharStyle->bold.value_or(false),
+          QStringLiteral("deleting keeps the pending character style"));
+    auto selectAllPending = ei::applyKey(pending.state, makeKey(Qt::Key_A, Qt::ControlModifier),
+                                         doc, layout);
+    check(selectAllPending.state.pendingCharStyle.has_value()
+              && selectAllPending.state.pendingCharStyle->bold.value_or(false),
+          QStringLiteral("select all keeps the pending character style"));
+    auto cutBase = ei::makeInitialState(doc, layout, body, 10);
+    cutBase.selection = ei::makeSelection(layout, body, {5, 12});
+    cutBase.selectionAnchor = 5;
+    cutBase.pendingCharStyle = bold;
+    auto cutKept = ei::applyAction(cutBase, makeAction(ei::EditActionKind::Cut), doc, layout);
+    check(cutKept.state.pendingCharStyle.has_value()
+              && cutKept.state.pendingCharStyle->bold.value_or(false),
+          QStringLiteral("cutting keeps the pending character style"));
 
     // 连续上下移动要一直沿用第一次记下的期望列。
     auto down1 = ei::applyKey(ei::makeInitialState(doc, layout, body, 100),
