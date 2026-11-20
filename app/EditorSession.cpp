@@ -11,6 +11,7 @@
 #include <QSaveFile>
 #include <algorithm>
 #include <utility>
+#include <QDebug>
 
 namespace editor::app {
 namespace {
@@ -262,7 +263,10 @@ void EditorSession::select(const interaction::Hit& anchor, const interaction::Hi
 
     const int start = interaction::alignToGrapheme(content->text, anchor.offset);
     const int end = interaction::alignToGrapheme(content->text, focus.offset);
+    //里面直接默认构造了，所以出问题
     auto state = interaction::makeInitialState(snapshot_, layout_, focus.containerId, end);
+    //这里直接赋值回原来的就好，目前最小的改动就是这样，之后建议增加interaction::makeInitialState(snapshot_, layout_, containerId, offset, &state_);
+    state.pendingCharStyle = state_.pendingCharStyle;
     if (start != end) {
         state.selection = interaction::makeSelection(layout_, {anchor.containerId, start},
                                                     {focus.containerId, end});
