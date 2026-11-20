@@ -107,6 +107,142 @@ void chooseFile(MainWindow& window, const QString& path)
     });
 }
 
+void testParagraphLayout(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("AB"));
+    sendKey(input, Qt::Key_Return);
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("CD"));
+    sendKey(input, Qt::Key_Home, Qt::ControlModifier);
+
+    const auto combos = window.findChild<QToolBar*>(QStringLiteral("mainToolBar"))->findChildren<QComboBox*>();
+    const auto role = std::find_if(combos.begin(), combos.end(), [](QComboBox* combo) {
+        return combo->findData(-1) >= 0 && combo->findData(2) >= 0;
+    });
+    check(role != combos.end(), "Missing the paragraph style control");
+    auto* size = window.findChild<QDoubleSpinBox*>();
+    check(size != nullptr, "Missing the font size control");
+    const auto font = [&] { return session.layout().textLayouts.front()->font(); };
+    const int bodyPixels = font().pixelSize();
+    const qreal bodyHeight = session.layout().textFragments.front().rect.height();
+
+    (*role)->activated((*role)->findData(-1));
+    const int titlePixels = font().pixelSize();
+    check(titlePixels > bodyPixels && font().bold() && size->value() > 12,
+          "The Title toolbar option did not change the laid-out text and displayed font size");
+    (*role)->activated((*role)->findData(1));
+    const int heading1Pixels = font().pixelSize();
+    (*role)->activated((*role)->findData(2));
+    check(titlePixels > heading1Pixels && heading1Pixels > font().pixelSize() &&
+          font().pixelSize() > bodyPixels && font().bold(), "Heading levels did not change the laid-out text");
+    (*role)->activated((*role)->findData(0));
+    check(font().pixelSize() == bodyPixels && !font().bold() && size->value() == 12,
+          "Restoring Body did not restore the inherited font");
+
+    sendKey(input, Qt::Key_Right, Qt::ShiftModifier);
+    size->setValue(72);
+    const auto& layout = session.layout();
+    check(layout.textFragments.size() == 2, "Expected two lines of text");
+    const auto& large = layout.textFragments.front();
+    const auto& normal = layout.textFragments.back();
+    const auto largeLine = layout.textLayouts[large.layoutIndex]->lineAt(large.lineIndex);
+    check(largeLine.height() > bodyHeight && large.rect.height() >= largeLine.height() &&
+          normal.rect.height() == bodyHeight && normal.rect.top() >= large.rect.bottom(),
+          "A large font must expand its line without clipping, overlapping or expanding the next line");
+
+    auto wrapCase = editor::testing::makeLayoutCase(QStringLiteral("02"));
+    auto& body = wrapCase.document.root.children.back();
+    data::TextFormatSpan largeCharacter;
+    largeCharacter.range = {0, 1};
+    largeCharacter.style.fontSizePt = 72;
+    body.text.formatSpans.push_back(largeCharacter);
+    check(session.loadSnapshot(wrapCase.document), "Could not load the large text wrap case");
+    const auto& wrapped = session.layout();
+    const auto picture = std::find_if(wrapped.containers.begin(), wrapped.containers.end(), [](const auto& box) {
+        return box.containerId == QStringLiteral("photo1");
+    });
+    check(picture != wrapped.containers.end(), "Missing the floating image box");
+    bool tallRowReachedImage = false;
+    for (const auto& fragment : wrapped.textFragments) {
+        if (fragment.containerId != body.id)
+            continue;
+        check(!fragment.rect.intersects(picture->outerRect), "The expanded text row overlaps the floating image");
+        if (fragment.sourceRange.start == 0)
+            tallRowReachedImage = fragment.rect.top() < picture->outerRect.top() &&
+                                  fragment.rect.bottom() > picture->outerRect.top();
+    }
+    check(tallRowReachedImage, "The first large character must wrap beside the image that starts below it");
+
+    check(session.newDocument(), "Could not reset the document after testing paragraph layout");
+}
+
+void testWrapUsesCurrentRowHeight(app::EditorSession& session)
+{
+    auto doc = editor::testing::makeLayoutCase(QStringLiteral("02")).document;
+    auto body = doc.root.children.back();
+    auto picture = body.children.front();
+    // The line separator starts a new visual row inside the same paragraph.
+    body.children.clear();
+    body.text.text = QStringLiteral("small\u2028BIG");
+    data::ParagraphInfo paragraph;
+    paragraph.range = {0, int(body.text.text.size())};
+    body.text.paragraphs = {paragraph};
+    body.text.formatSpans = {{{6, paragraph.range.end}, {}}};
+    body.text.formatSpans.front().style.fontSizePt = 48;
+    doc.root.children = {body};
+    check(session.loadSnapshot(doc), "Could not load the mixed-height paragraph");
+    check(session.layout().textFragments.size() == 2, "Expected two rows in a single paragraph");
+    const QRectF firstRow = session.layout().textFragments.front().rect;
+    const qreal secondHeight = session.layout().textFragments.back().rect.height();
+    check(secondHeight > firstRow.height() + 1, "Expected the later row to be taller");
+
+    picture.geometry.position = QPointF(0, firstRow.height() + 1);
+    picture.geometry.margin = {};
+    picture.geometry.padding = {};
+    picture.image.displaySize = QSizeF(firstRow.width(), 32);
+    doc.root.children.front().children.push_back(picture);
+    check(session.loadSnapshot(doc), "Could not add a full-width image below the small row");
+    const auto& wrapped = session.layout();
+    check(wrapped.images.size() == 1 && wrapped.textFragments.size() == 2, "Expected one image and two text rows");
+    check(wrapped.textFragments.front().rect == firstRow,
+          "A tall later row must not make an earlier small row avoid the image");
+    check(wrapped.textFragments.back().rect.top() >= wrapped.images.front().rect.bottom(),
+          "The tall row must still avoid the image");
+    check(wrapped.textFragments.front().sourceRange.end == wrapped.textFragments.back().sourceRange.start &&
+          wrapped.textFragments.back().sourceRange.end == paragraph.range.end,
+          "Retrying a blocked row lost or repeated text");
+
+    // The second image appears only after the tall row grows, so the existing
+    // left and right fragments need to be measured again as a single row.
+    const qreal width = firstRow.width();
+    picture.geometry.position = QPointF(width / 3, firstRow.height());
+    picture.image.displaySize = QSizeF(width / 8, 42);
+    auto lowerImage = picture;
+    lowerImage.id = QStringLiteral("photo-lower");
+    lowerImage.geometry.position = QPointF(width * 2 / 3, firstRow.height() + 32);
+    auto& retryBody = doc.root.children.front();
+    retryBody.children = {picture, lowerImage};
+    retryBody.text.text = QStringLiteral("small\u2028W ") + QStringLiteral("word ").repeated(40);
+    retryBody.text.paragraphs.front().range.end = int(retryBody.text.text.size());
+    retryBody.text.formatSpans.front().range = {6, 7};
+    check(session.loadSnapshot(doc), "Could not load the split-row retry case");
+    const auto& split = session.layout();
+    check(split.images.size() == 2 && split.textFragments.front().rect == firstRow,
+          "The preceding row must stay intact when a split row is retried");
+    int next = 0;
+    int tallFragments = 0;
+    for (const auto& fragment : split.textFragments) {
+        check(fragment.sourceRange.start == next, "Retrying multiple row fragments lost or repeated text");
+        next = fragment.sourceRange.end;
+        if (fragment.rect.top() == firstRow.bottom() && fragment.rect.height() > 32)
+            ++tallFragments;
+        for (const auto& entry : split.images)
+            check(!fragment.rect.intersects(entry.rect), "A retried fragment overlaps one of its obstacles");
+    }
+    check(tallFragments >= 2 && next == retryBody.text.text.size(),
+          "The tall row should still wrap around both images");
+    check(session.newDocument(), "Could not reset after the wrap height test");
+}
+
 void testEditing(MainWindow& window, app::EditorSession& session, QWidget& input, const QTemporaryDir& output)
 {
     const auto firstId = session.state().caret.containerId;
@@ -409,6 +545,8 @@ int main(int argc, char** argv)
     const QTemporaryDir output(QApplication::applicationDirPath() + QStringLiteral("/editor-test-XXXXXX"));
     check(output.isValid(), "Could not create a temporary directory for DOCX files");
     auto& session = integration.session();
+    testParagraphLayout(window, session, *input);
+    testWrapUsesCurrentRowHeight(session);
     testEditing(window, session, *input, output);
     testFontSelection(window, session, *input);
     testIme(session, *input);

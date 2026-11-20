@@ -241,7 +241,7 @@ data::TextStyle EditorSession::currentStyle() const
     const int offset = state_.selection ? state_.selection->range.start : state_.caret.offset;
     auto style = text->defaultStyle;
     if (const auto* paragraph = paragraphAt(*text, offset))
-        mergeStyle(style, paragraph->defaultStyle);
+        style = layout::resolveParagraphStyle(style, *paragraph);
     const int character = offset == text->text.size() ? offset - 1 : offset;
     const auto span = std::lower_bound(text->formatSpans.begin(), text->formatSpans.end(), character,
         [](const data::TextFormatSpan& entry, int position) { return entry.range.end <= position; });
