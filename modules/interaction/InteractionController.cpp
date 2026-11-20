@@ -280,7 +280,8 @@ InteractionOutput insertText(const InteractionState& state,
     out.state.selection.reset();
     out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
-    out.state.pendingCharStyle.reset();
+    // 当前输入格式用完后继续保留，后面每个字都沿用，直到再次修改格式或光标移到别处。
+    // 打字/粘贴/输入法上屏都不是"修改格式"，不能清掉它，否则后续输入会回落默认。
     out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
@@ -317,7 +318,7 @@ InteractionOutput deleteText(const InteractionState& state,
     out.state.selection.reset();
     out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
-    out.state.pendingCharStyle.reset();
+    // 删除只是编辑内容，不是"再次修改格式"：待用格式继续留给后续输入使用。
     out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
@@ -348,7 +349,7 @@ InteractionOutput copyOrCut(const InteractionState& state,
     out.state.selection.reset();
     out.state.selectionAnchor.reset();
     out.state.preedit = PreeditState{};
-    out.state.pendingCharStyle.reset();
+    // 剪切只是编辑内容，不是"再次修改格式"：待用格式继续留给后续输入使用。
     out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
@@ -365,7 +366,7 @@ InteractionOutput selectAllText(const InteractionState& state,
     out.state.selection = makeSelection(layout, id, range);
     out.state.selectionAnchor = range.start;
     out.state.preedit = PreeditState{};
-    out.state.pendingCharStyle.reset();
+    // 全选只是选中内容，不是"再次修改格式"：待用格式继续保留。
     out.state.desiredCaretX.reset();
     out.state = refreshStateGeometry(out.state, layout);
     return out;
@@ -466,9 +467,8 @@ InteractionOutput moveCaret(const InteractionState& state,
         out.state.selectionAnchor.reset();
     }
 
-    // 光标位置一变，之前在工具栏设的待用格式就不该继续使用；期望列只在
-    // 连续上下移动时保留，其它移动一律清空。
-    out.state.pendingCharStyle.reset();
+    // 光标移动不是"再次修改格式"，待用格式继续保留给后续输入使用；
+    // 期望列只在连续上下移动时保留，其它移动一律清空。
     if (vertical)
         out.state.desiredCaretX = targetX;
     else
@@ -503,7 +503,11 @@ InteractionOutput setCharFormat(const InteractionState& state,
         request.range = *selection;
         request.charStyle = action.charStyle;
         out.requests.push_back(request);
-        out.state.pendingCharStyle.reset();
+        // 选中文字改格式后，让这个格式也成为"当前输入格式"，
+        // 后面接着输入的字沿用同一格式，直到再次修改或光标移到别处。
+        out.state.pendingCharStyle = state.pendingCharStyle
+            ? mergeCharStyle(*state.pendingCharStyle, action.charStyle)
+            : action.charStyle;
     } else {
         out.state.pendingCharStyle = state.pendingCharStyle
             ? mergeCharStyle(*state.pendingCharStyle, action.charStyle)
