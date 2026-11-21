@@ -202,6 +202,33 @@ void floatingImageReflowsText()
     checkPageGeometry(result);
 }
 
+void laterLargeTextDoesNotMoveTheFirstRow()
+{
+    auto doc = document();
+    auto body = text("body", QStringLiteral("small\u2028BIG"));
+    data::TextFormatSpan span{{6, int(body.text.text.size())}, {}};
+    span.style.fontSizePt = 36;
+    body.text.formatSpans = {span};
+    doc.root.children = {body};
+    const auto plain = paged::composeLayout(doc);
+    const auto firstRow = plain.pages[0].textFragments.front().rect;
+
+    auto picture = image(doc, "full-width-float", QSizeF(firstRow.width(), 32));
+    picture.placement = data::PlacementMode::Floating;
+    picture.geometry.position.setY(firstRow.height() + 1);
+    doc.root.children[0].children = {picture};
+    const auto wrapped = paged::composeLayout(doc);
+    check(wrapped.issues.empty() && wrapped.pages.size() == 2 &&
+          wrapped.pages.front().images.size() == 1 && wrapped.pages.front().textFragments.size() == 1 &&
+          wrapped.pages.front().textFragments.front().rect == firstRow,
+          "A larger row later in the same paragraph must not move the small row above the image");
+    check(wrapped.pages[1].textFragments.size() == 1 &&
+          wrapped.pages[1].textFragments.front().sourceRange.start == 6 &&
+          wrapped.pages[1].textFragments.front().rect.height() > firstRow.height(),
+          "The large row must still avoid the image and move whole to the next page");
+    checkPageGeometry(wrapped);
+}
+
 void rowSplitAroundImageRetriesAsAWhole()
 {
     auto doc = document();
@@ -261,6 +288,7 @@ int main(int argc, char** argv)
     wrappedTextAndStyles();
     flowImageAndGroup();
     floatingImageReflowsText();
+    laterLargeTextDoesNotMoveTheFirstRow();
     rowSplitAroundImageRetriesAsAWhole();
     invalidObjects();
     qInfo("Paged layout acceptance passed");

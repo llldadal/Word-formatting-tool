@@ -114,21 +114,6 @@ std::shared_ptr<QTextLayout> makeParagraphLayout(const data::TextContent& text,
     return layout;
 }
 
-qreal obstacleBandHeight(QTextLayout& layout, qreal width, qreal minimumHeight)
-{
-    // Use the actual Qt metrics, including the fonts selected as fallbacks.
-    qreal ascent = 0;
-    qreal descent = 0;
-    layout.beginLayout();
-    for (auto line = layout.createLine(); line.isValid(); line = layout.createLine()) {
-        line.setLineWidth(width);
-        ascent = qMax(ascent, line.ascent());
-        descent = qMax(descent, line.descent());
-    }
-    layout.endLayout();
-    return qMax(minimumHeight, std::ceil(ascent + descent));
-}
-
 struct RowSlots {
     std::vector<QRectF> areas;
     qreal nextClearY;
@@ -177,6 +162,14 @@ struct DraftRow {
     bool finished = false;
     bool tooWide = false;
 };
+
+bool sameHorizontalSlots(const RowSlots& a, const RowSlots& b)
+{
+    return std::equal(a.areas.begin(), a.areas.end(), b.areas.begin(), b.areas.end(),
+        [](const QRectF& left, const QRectF& right) {
+            return left.x() == right.x() && left.width() == right.width();
+        });
+}
 
 class ParagraphLines {
 public:
@@ -241,6 +234,29 @@ private:
     QTextLine pending_;
     std::vector<QRectF> committed_;
 };
+
+DraftRow fitRowAroundObstacles(ParagraphLines& lines, QRectF band, qreal minimumHeight,
+                               qreal remainingHeight, const Obstacles& obstacles, int page,
+                               RowSlots& rowSlots)
+{
+    rowSlots = availableSlots(band, obstacles, page);
+    auto row = lines.tryRow(rowSlots, minimumHeight);
+    while (true) {
+        const qreal actualBandHeight = qMin(row.height, remainingHeight);
+        if (actualBandHeight <= band.height() + tolerance)
+            return row;
+
+        // Grow only the current row's band. Keeping that height through retries
+        // avoids oscillation when narrowing the row pushes a large glyph out.
+        band.setHeight(actualBandHeight);
+        auto reduced = availableSlots(band, obstacles, page);
+        if (sameHorizontalSlots(rowSlots, reduced))
+            return row;
+        lines.retry(row);
+        rowSlots = std::move(reduced);
+        row = lines.tryRow(rowSlots, minimumHeight);
+    }
+}
 
 class Paginator {
 public:
@@ -468,8 +484,6 @@ private:
             auto layout = makeParagraphLayout(node.text, paragraph);
             const int layoutIndex = static_cast<int>(result_.textLayouts.size());
             result_.textLayouts.push_back(layout);
-            const qreal wrapHeight = obstacles.empty() ? format.lineHeight
-                : obstacleBandHeight(*layout, area.width(), format.lineHeight);
             ParagraphLines lines(*layout);
             bool firstRow = true;
             bool finished = false;
@@ -482,11 +496,13 @@ private:
                     (firstRow ? format.firstLineIndent : 0), area.right());
                 const qreal width = area.right() - left - format.rightIndent;
                 // Match v0.1: when indents exhaust the width, use the whole content area.
+                const qreal remainingHeight = area.bottom() - cursor.y;
                 const QRectF band(width > tolerance ? left : area.left(), cursor.y,
                                   width > tolerance ? width : area.width(),
-                                  qMin(wrapHeight, area.bottom() - cursor.y));
-                const auto rowSlots = availableSlots(band, obstacles, cursor.page);
-                const auto row = lines.tryRow(rowSlots, format.lineHeight);
+                                  qMin(format.lineHeight, remainingHeight));
+                RowSlots rowSlots;
+                const auto row = fitRowAroundObstacles(lines, band, format.lineHeight,
+                                                        remainingHeight, obstacles, cursor.page, rowSlots);
                 if (row.fragments.empty()) {
                     if (row.finished)
                         break;
