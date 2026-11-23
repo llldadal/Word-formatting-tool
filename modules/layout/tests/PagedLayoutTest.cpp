@@ -105,6 +105,74 @@ void pageGrowthAndShrink()
           "Editing must recompute the page count and revision");
 }
 
+const data::ContainerLayout& boxFor(const paged::LayoutPage& page, const QString& id)
+{
+    const auto box = std::find_if(page.containers.begin(), page.containers.end(),
+        [&](const auto& item) { return item.containerId == id; });
+    check(box != page.containers.end(), "Expected a container slice on this page");
+    return *box;
+}
+
+void verticalInsetsAppearOnlyAtContainerEnds()
+{
+    auto doc = document();
+    doc.page.size.setHeight(800);
+    doc.page.margins.setTop(50);
+    doc.page.margins.setBottom(50);
+    auto body = text("body", QStringLiteral("line\n").repeated(31) + QStringLiteral("last"));
+    body.geometry.margin = QMarginsF(4, 30, 4, 30);
+    body.geometry.padding = QMarginsF(5, 20, 5, 20);
+    for (auto& paragraph : body.text.paragraphs)
+        paragraph.format.lineHeight = 50;
+    doc.root.children = {body, text("following", "next")};
+
+    const auto result = paged::composeLayout(doc);
+    check(result.issues.empty() && result.pages.size() == 3, "Repeated insets must not change the page count");
+    const auto& first = result.pages[0];
+    const auto& middle = result.pages[1];
+    const auto& last = result.pages[2];
+    const auto& firstBox = boxFor(first, body.id);
+    const auto& middleBox = boxFor(middle, body.id);
+    const auto& lastBox = boxFor(last, body.id);
+    check(first.textFragments.size() == 13 && first.textFragments.front().rect.top() == 100 &&
+          first.textFragments.back().rect.bottom() == 750 && firstBox.rect.top() == 80 &&
+          firstBox.outerRect.bottom() == 750, "First slice uses only its opening margin and padding");
+    check(middle.textFragments.size() == 14 && middle.textFragments.front().rect.top() == 50 &&
+          middle.textFragments.back().rect.bottom() == 750 && middleBox.rect.top() == 50 &&
+          middleBox.rect.bottom() == 750 &&
+          middleBox.outerRect.top() == 50 && middleBox.outerRect.bottom() == 750,
+          "Middle slice uses full height inside the page margins");
+    check(last.textFragments.front().rect.top() == 50 && lastBox.contentRect.bottom() == 300 &&
+          lastBox.rect.bottom() == 320 && lastBox.outerRect.bottom() == 350 &&
+          last.textFragments.back().containerId == QStringLiteral("following") &&
+          last.textFragments.back().rect.top() == 350, "Only the last slice uses the closing insets");
+    check(firstBox.contentRect.left() == middleBox.contentRect.left() &&
+          middleBox.contentRect.left() == lastBox.contentRect.left(), "Side insets must remain on every page");
+    checkPageGeometry(result);
+}
+
+void closingSpaceStaysWithLastRow()
+{
+    auto doc = document();
+    auto body = text("body", "a\nb\nc");
+    body.geometry.padding.setBottom(5);
+    data::ContainerNode group;
+    group.id = QStringLiteral("group");
+    group.geometry.margin.setBottom(7);
+    group.children = {body};
+    doc.root.children = {group, text("following", "next")};
+
+    const auto result = paged::composeLayout(doc);
+    check(result.issues.empty() && result.pages.size() == 2 &&
+          result.pages[0].textFragments.size() == 2 && result.pages[1].textFragments.size() == 2,
+          "Move the last row with its closing insets instead of creating an empty page");
+    const auto& second = result.pages[1];
+    check(second.textFragments[0].sourceRange.start == 4 && second.textFragments[0].rect.top() == 14 &&
+          boxFor(second, group.id).outerRect.bottom() == 50 && second.textFragments[1].rect.top() == 50,
+          "Closing insets from child and parent apply only once");
+    checkPageGeometry(result);
+}
+
 void wrappedTextAndStyles()
 {
     auto doc = document();
@@ -262,16 +330,41 @@ void invalidObjects()
     auto missing = picture;
     missing.id = QStringLiteral("missing");
     missing.image = {QStringLiteral("absent"), QSizeF(30, 20)};
-    auto large = text("oversize-text", "W");
-    large.text.defaultStyle.fontSizePt = 96;
+    auto large = text("oversize-text", "W\nnormal");
+    data::TextFormatSpan enlarged{{0, 1}, {}};
+    enlarged.style.fontSizePt = 96;
+    large.text.formatSpans = {enlarged};
     doc.root.children = {picture, missing, large, text("valid", "ok")};
     const auto result = paged::composeLayout(doc);
     check(result.issues.size() == 3 && result.issues[0].kind == paged::LayoutIssueKind::ImageDoesNotFit &&
           result.issues[0].containerId == picture.id && result.issues[1].kind == paged::LayoutIssueKind::MissingImage &&
           result.issues[2].kind == paged::LayoutIssueKind::TextRowDoesNotFit && result.issues[2].sourceRange,
           "Unplaceable objects must report an ID, kind and source range where applicable");
-    check(result.pages.size() == 1 && result.pages[0].textFragments.back().containerId == QStringLiteral("valid"),
-          "An unplaceable object must not prevent following content from laying out");
+    check(result.pages.size() == 2 && result.pages[0].textFragments.size() == 1 &&
+          result.pages[1].textFragments.size() == 2, "Preserve the oversized line on an isolated page");
+    const auto& overflow = result.pages[0].textFragments.front();
+    const auto line = result.textLayouts[overflow.layoutIndex]->lineAt(overflow.lineIndex);
+    check(overflow.containerId == large.id && overflow.sourceRange.start == 0 && overflow.sourceRange.end == 1 &&
+          line.isValid() && line.position() == overflow.rect.topLeft() &&
+          overflow.rect.bottom() > result.pages[0].contentRect.bottom() &&
+          result.pages[0].layoutBounds.contains(overflow.rect),
+          "Oversized text must keep its original range and a usable preview rectangle");
+    const auto& next = result.pages[1].textFragments;
+    check(next[0].containerId == large.id && next[0].sourceRange.start == 2 &&
+          next[1].containerId == QStringLiteral("valid") && next[1].rect.top() >= next[0].rect.bottom(),
+          "Following text must continue after the overflow without overlapping");
+
+    auto narrow = document();
+    auto wide = text("narrow", "W");
+    wide.geometry.width = 5;
+    narrow.root.children = {text("before", "before"), wide, text("after", "after")};
+    const auto wideResult = paged::composeLayout(narrow);
+    check(wideResult.issues.size() == 1 && wideResult.pages.size() == 3 &&
+          wideResult.pages[1].textFragments.size() == 1 &&
+          wideResult.pages[1].textFragments[0].containerId == wide.id &&
+          wideResult.pages[1].textFragments[0].rect.width() > wide.geometry.width &&
+          wideResult.pages[2].textFragments[0].containerId == QStringLiteral("after"),
+          "Too-wide glyph must remain selectable without sharing its page with adjacent containers");
 
     doc.page.margins.setBottom(100);
     const auto invalid = paged::composeLayout(doc);
@@ -285,6 +378,8 @@ int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
     pageGrowthAndShrink();
+    verticalInsetsAppearOnlyAtContainerEnds();
+    closingSpaceStaysWithLastRow();
     wrappedTextAndStyles();
     flowImageAndGroup();
     floatingImageReflowsText();

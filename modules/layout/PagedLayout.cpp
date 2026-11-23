@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <utility>
 
 namespace editor::layout::v02 {
@@ -283,6 +284,10 @@ public:
             std::stable_sort(item.containers.begin(), item.containers.end(), [&](const auto& a, const auto& b) {
                 return order_.value(a.containerId) < order_.value(b.containerId);
             });
+            for (const auto& box : item.containers)
+                item.layoutBounds = item.layoutBounds.united(box.outerRect);
+            for (const auto& fragment : item.textFragments)
+                item.layoutBounds = item.layoutBounds.united(fragment.rect);
         }
         return std::move(result_);
     }
@@ -311,7 +316,7 @@ private:
     LayoutPage& page(int index)
     {
         while (int(result_.pages.size()) <= index)
-            result_.pages.push_back(LayoutPage{paper_, content_, {}, {}, {}});
+            result_.pages.push_back(LayoutPage{paper_, content_, {}, {}, {}, paper_});
         return result_.pages[index];
     }
 
@@ -332,7 +337,7 @@ private:
     }
 
     Spans layoutChildren(const data::ContainerNode& parent, const QRectF& area, Cursor start,
-                         bool floating, const data::ContainerId& parentId)
+                         bool floating, const data::ContainerId& parentId, qreal closingSpace = 0)
     {
         Spans spans;
         Obstacles occupied;
@@ -343,6 +348,8 @@ private:
             auto position = offsetFrom(start, qMax(0.0, g.position.y() - g.margin.top()), area);
             if (!floating)
                 position = std::max(position, previous);
+            while (overflowPages_.count(position.page))
+                position = {position.page + 1, area.top()};
             if (!validPage(position.page, node.id))
                 continue;
 
@@ -351,9 +358,11 @@ private:
             const qreal width = node.type == data::ContainerType::Image
                 ? node.image.displaySize.width() + g.padding.left() + g.padding.right()
                 : g.width == 0 ? area.right() - x - g.margin.right() : g.width;
+            const qreal parentClosingSpace = !floating && &node == &parent.children.back()
+                ? closingSpace : 0;
             auto boxes = node.type == data::ContainerType::Image
-                ? layoutImage(node, parentId, area, position, x, width, occupied)
-                : layoutContainer(node, parentId, area, position, x, width, occupied);
+                ? layoutImage(node, parentId, area, position, x, width, occupied, parentClosingSpace)
+                : layoutContainer(node, parentId, area, position, x, width, occupied, parentClosingSpace);
             for (const auto& [index, outer] : boxes) {
                 include(spans, index, outer.top(), outer.bottom());
                 if (floating)
@@ -369,7 +378,7 @@ private:
 
     Boxes layoutImage(const data::ContainerNode& node, const data::ContainerId& parentId,
                       const QRectF& area, Cursor position, qreal x, qreal width,
-                      const Obstacles& occupied)
+                      const Obstacles& occupied, qreal closingSpace)
     {
         const auto& g = node.geometry;
         const qreal height = qMax(g.minimumHeight, node.image.displaySize.height() + g.padding.top() + g.padding.bottom());
@@ -386,8 +395,10 @@ private:
             return {};
         }
 
+        const qreal reservedHeight = outerHeight + closingSpace <= area.height() + tolerance
+            ? outerHeight + closingSpace : outerHeight;
         while (validPage(position.page, node.id)) {
-            if (position.y + outerHeight > area.bottom() + tolerance) {
+            if (overflowPages_.count(position.page) || position.y + reservedHeight > area.bottom() + tolerance) {
                 position = {position.page + 1, area.top()};
                 continue;
             }
@@ -417,26 +428,33 @@ private:
 
     Boxes layoutContainer(const data::ContainerNode& node, const data::ContainerId& parentId,
                           const QRectF& area, Cursor position, qreal x, qreal width,
-                          const Obstacles& externalObstacles)
+                          const Obstacles& externalObstacles, qreal parentClosingSpace)
     {
         const auto& g = node.geometry;
         const qreal top = g.margin.top() + g.padding.top();
         const qreal bottom = g.margin.bottom() + g.padding.bottom();
-        const auto inner = QRectF(x + g.padding.left(), area.top() + top,
-                                  width - g.padding.left() - g.padding.right(), area.height() - top - bottom);
+        // Left and right insets apply to all slices. Vertical insets are
+        // consumed once, at the beginning and end of this container's flow.
+        const auto inner = QRectF(x + g.padding.left(), area.top(),
+                                  width - g.padding.left() - g.padding.right(), area.height());
         if (!validArea(inner) || !containsWidth(area, x - g.margin.left(), x + width + g.margin.right()) ||
-            !std::isfinite(g.minimumHeight)) {
+            !std::isfinite(g.minimumHeight) || top >= area.height() - tolerance ||
+            bottom > area.height() + tolerance) {
             issue(LayoutIssueKind::ContainerDoesNotFit, node.id, QStringLiteral("容器及其边距无法形成页内正文区"));
             return {};
         }
         Cursor start{position.page, position.y + top};
         if (start.y >= inner.bottom() - tolerance)
-            start = {start.page + 1, inner.top()};
+            start = {start.page + 1, inner.top() + top};
+        while (overflowPages_.count(start.page))
+            start = {start.page + 1, inner.top() + top};
         if (!validPage(start.page, node.id))
             return {};
 
         const bool isText = node.type == data::ContainerType::Text;
-        auto spans = layoutChildren(node, inner, start, isText, node.id);
+        const qreal closingSpace = bottom + parentClosingSpace;
+        const qreal keepClosingSpace = g.minimumHeight == 0 ? closingSpace : 0;
+        auto spans = layoutChildren(node, inner, start, isText, node.id, keepClosingSpace);
         if (isText) {
             auto obstacles = externalObstacles;
             for (const auto& [index, unused] : spans) {
@@ -444,13 +462,20 @@ private:
                     if (box.parentId == node.id)
                         obstacles[index].push_back(box.outerRect);
             }
-            layoutText(node, inner, start, obstacles, spans);
+            layoutText(node, inner, start, obstacles, spans, keepClosingSpace, top);
         }
 
         // Minimum height belongs to the container, including when it has no text.
         qreal extra = qMax(0.0, g.minimumHeight - g.padding.top() - g.padding.bottom());
         if (spans.empty() || extra > 0) {
             for (auto cursor = start; validPage(cursor.page, node.id); cursor = {cursor.page + 1, inner.top()}) {
+                if (overflowPages_.count(cursor.page)) {
+                    if (spans.count(cursor.page))
+                        extra -= qMax(0.0, inner.bottom() - cursor.y);
+                    if (extra <= tolerance)
+                        break;
+                    continue;
+                }
                 const qreal available = inner.bottom() - cursor.y;
                 include(spans, cursor.page, cursor.y, cursor.y + qMin(available, extra));
                 if (extra <= available + tolerance)
@@ -458,24 +483,54 @@ private:
                 extra -= available;
             }
         }
-        auto first = spans.find(start.page);
-        if (first != spans.end())
-            first->second.top = start.y;
+        if (top > 0 || spans.count(start.page))
+            include(spans, start.page, start.y, start.y);
+        if (spans.empty())
+            return {};
+
+        const auto [lastPage, lastSpan] = *spans.rbegin();
+        if (bottom > tolerance && !overflowPages_.count(lastPage) &&
+            lastSpan.bottom + bottom > inner.bottom() + tolerance) {
+            // If the ending item and its closing insets cannot share a page,
+            // carry the closing insets once to the next available page.
+            int next = lastPage + 1;
+            while (overflowPages_.count(next))
+                ++next;
+            if (validPage(next, node.id))
+                include(spans, next, inner.top(), inner.top());
+        }
 
         Boxes boxes;
         for (const auto& [index, span] : spans) {
-            const QRectF frame(x, span.top - g.padding.top(), width,
-                               span.bottom - span.top + g.padding.top() + g.padding.bottom());
-            const auto outer = frame.marginsAdded(g.margin);
-            page(index).containers.push_back({node.id, parentId, frame, inset(frame, g.padding), outer});
+            const bool first = index == spans.begin()->first;
+            const bool last = index == spans.rbegin()->first;
+            const QMarginsF padding(g.padding.left(), first ? g.padding.top() : 0,
+                                    g.padding.right(), last ? g.padding.bottom() : 0);
+            const QMarginsF margin(g.margin.left(), first ? g.margin.top() : 0,
+                                   g.margin.right(), last ? g.margin.bottom() : 0);
+            const QRectF body(inner.left(), span.top, inner.width(), span.bottom - span.top);
+            const auto frame = body.marginsAdded(padding);
+            const auto outer = frame.marginsAdded(margin);
+            page(index).containers.push_back({node.id, parentId, frame, body, outer});
             boxes.emplace_back(index, outer);
         }
         return boxes;
     }
 
-    void layoutText(const data::ContainerNode& node, const QRectF& area, Cursor cursor,
-                    const Obstacles& obstacles, Spans& spans)
+    void layoutText(const data::ContainerNode& node, const QRectF& area, Cursor& start,
+                    const Obstacles& obstacles, Spans& spans, qreal closingSpace, qreal leadingSpace)
     {
+        Cursor cursor = start;
+        const auto nextPage = [&] {
+            ++cursor.page;
+            cursor.y = area.top();
+            // Before placing the first item, move the opening insets along with
+            // it when the previous page did not have room to start the content.
+            if (spans.empty()) {
+                cursor.y += leadingSpace;
+                start = cursor;
+            }
+        };
         for (const auto& paragraph : node.text.paragraphs) {
             if (!validPage(cursor.page, node.id))
                 return;
@@ -489,7 +544,9 @@ private:
             bool finished = false;
             while (!finished) {
                 if (cursor.y >= area.bottom() - tolerance)
-                    cursor = {cursor.page + 1, area.top()};
+                    nextPage();
+                while (overflowPages_.count(cursor.page))
+                    nextPage();
                 if (!validPage(cursor.page, node.id))
                     return;
                 const qreal left = qBound(area.left(), area.left() + format.leftIndent +
@@ -514,43 +571,96 @@ private:
                 if (row.tooWide || (!rowSlots.obstructed && row.height > area.height() + tolerance)) {
                     issue(LayoutIssueKind::TextRowDoesNotFit, node.id,
                           QStringLiteral("文字行超出页内可用宽度或高度"), range);
-                    lines.commit(row);
+                    if (!placeOversizedRow(node.id, paragraph.range.start, layoutIndex, lines, row,
+                                           area, cursor, spans, start, leadingSpace))
+                        return;
+                    cursor = {cursor.page + 1, area.top()};
                     finished = row.finished;
                     firstRow = false;
                     continue;
                 }
-                if (cursor.y + row.height > area.bottom() + tolerance) {
+                const Cursor rowEnd{cursor.page, cursor.y + row.height};
+                const bool lastRow = row.finished && &paragraph == &node.text.paragraphs.back();
+                const bool endsContainer = lastRow && (spans.empty() ||
+                    !(rowEnd < Cursor{spans.rbegin()->first, spans.rbegin()->second.bottom}));
+                const bool keepTail = endsContainer && row.height + closingSpace <= area.height() + tolerance &&
+                    (!spans.empty() || leadingSpace + row.height + closingSpace <= area.height() + tolerance);
+                if (rowEnd.y + (keepTail ? closingSpace : 0) > area.bottom() + tolerance) {
+                    if (spans.empty() && row.height + leadingSpace > area.height() + tolerance) {
+                        // The row fits a full page. Place the opening insets on
+                        // their own slice so the row has the full next page.
+                        include(spans, start.page, start.y, start.y);
+                    }
                     lines.retry(row);
-                    cursor = {cursor.page + 1, area.top()};
+                    nextPage();
                     continue;
                 }
 
-                lines.commit(row);
-                auto& fragments = page(cursor.page).textFragments;
-                for (const auto& draft : row.fragments) {
-                    const int start = paragraph.range.start + draft.line.textStart();
-                    auto rect = draft.rect;
-                    rect.setHeight(row.height);
-                    fragments.push_back({node.id, {start, start + draft.line.textLength()}, rect,
-                                         layoutIndex, draft.line.lineNumber()});
-                }
-                include(spans, cursor.page, cursor.y, cursor.y + row.height);
+                placeRow(node.id, paragraph.range.start, layoutIndex, lines, row, cursor, spans);
                 cursor.y += row.height;
                 finished = row.finished;
                 firstRow = false;
             }
             // Trailing paragraph space stops at the paper edge and cannot by itself create a page.
-            const qreal after = qMin(area.bottom(), cursor.y + format.spaceAfter);
-            if (spans.count(cursor.page))
+            const qreal bottom = (&paragraph == &node.text.paragraphs.back())
+                ? qMax(cursor.y, area.bottom() - closingSpace) : area.bottom();
+            const qreal after = qMin(bottom, cursor.y + format.spaceAfter);
+            if (spans.count(cursor.page) && !overflowPages_.count(cursor.page))
                 include(spans, cursor.page, cursor.y, after);
             cursor.y = after;
         }
+    }
+
+    void placeRow(const data::ContainerId& id, int paragraphStart, int layoutIndex,
+                  ParagraphLines& lines, const DraftRow& row, Cursor cursor, Spans& spans,
+                  bool preserveOverflow = false)
+    {
+        lines.commit(row);
+        auto& fragments = page(cursor.page).textFragments;
+        for (const auto& draft : row.fragments) {
+            const int offset = paragraphStart + draft.line.textStart();
+            auto rect = draft.rect;
+            rect.setHeight(row.height);
+            if (preserveOverflow)
+                rect.setWidth(qMax(rect.width(), draft.line.naturalTextWidth()));
+            fragments.push_back({id, {offset, offset + draft.line.textLength()}, rect,
+                                 layoutIndex, draft.line.lineNumber()});
+        }
+        include(spans, cursor.page, cursor.y, cursor.y + row.height);
+    }
+
+    bool hasPageContent(int index) const
+    {
+        if (index >= int(result_.pages.size()))
+            return false;
+        const auto& item = result_.pages[index];
+        return !item.containers.empty() || !item.images.empty() || !item.textFragments.empty();
+    }
+
+    bool placeOversizedRow(const data::ContainerId& id, int paragraphStart, int layoutIndex,
+                           ParagraphLines& lines, DraftRow row, const QRectF& area,
+                           Cursor& cursor, Spans& spans, Cursor& start, qreal leadingSpace)
+    {
+        int index = cursor.page;
+        while (hasPageContent(index) || overflowPages_.count(index))
+            ++index;
+        if (!validPage(index, id))
+            return false;
+        cursor = {index, area.top() + (spans.empty() ? leadingSpace : 0)};
+        if (spans.empty())
+            start = cursor;
+        for (auto& fragment : row.fragments)
+            fragment.rect.moveTop(cursor.y);
+        placeRow(id, paragraphStart, layoutIndex, lines, row, cursor, spans, true);
+        overflowPages_.insert(index);
+        return true;
     }
 
     const data::DocumentSnapshot& document_;
     const QRectF paper_;
     const QRectF content_;
     PagedLayoutResult result_;
+    std::set<int> overflowPages_;
     QHash<data::ContainerId, int> order_;
     int nextOrder_ = 0;
 };

@@ -14,6 +14,8 @@ struct LayoutPage {
     std::vector<data::ContainerLayout> containers;
     std::vector<data::TextFragment> textFragments;
     std::vector<data::ImageLayout> images;
+    // Includes the paper and any preserved oversized text outside it.
+    QRectF layoutBounds;
 };
 
 enum class LayoutIssueKind {
@@ -40,8 +42,10 @@ struct PagedLayoutResult {
     std::vector<LayoutIssue> issues;
 };
 
-// Paginate a document snapshot without changing it. An object that cannot be
-// placed is reported in issues. Other objects may still be laid out.
+// Paginate a document snapshot without changing it. Oversized text is reported
+// and kept at its original size on a page of its own. Preview can use
+// layoutBounds to reach it. Fixed-sheet export must handle the issue before
+// writing the document. Other objects may still be laid out.
 PagedLayoutResult composeLayout(const data::DocumentSnapshot& document);
 
 } // namespace editor::layout::v02
