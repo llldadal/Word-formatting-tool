@@ -4,6 +4,9 @@
 #include "TestFixtures.h"
 #include "TextBoundary.h"
 #include "ZipWriter.h"
+#include "ContainerHitTest.h"
+#include "CrossContainerCursor.h"
+#include "SnapEngine.h"
 
 #include <QAction>
 #include <QApplication>
@@ -529,6 +532,501 @@ void testRealLayouts(MainWindow& window, app::EditorSession& session, QWidget& i
           "Export must report the overflow compatibility error without writing a file");
 }
 
+void testContainerSelectionAndDeletion(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    // 1. 测试单容器选中与删空
+    check(session.newDocument(), "Failed to create new document");
+    const auto initialId = session.snapshot().root.children.front().id;
+    check(!initialId.isEmpty(), "Expected an initial container");
+
+    // 点击边框选中容器
+    const auto initialBox = session.layout().containers.front();
+    const QPointF borderPoint(initialBox.rect.left(), initialBox.rect.top());
+    auto* canvas = window.findChild<CanvasWidget*>();
+    clickAt(input, canvas->paperToWidget(borderPoint));
+    check(session.containerSelection().isSelected(initialId), "Clicking border did not select container");
+
+    // 正文顶层容器不暴露左右拉伸手柄，左右边缘中点应命中 ContainerBorder
+    const auto handleHit = edit::hitTestScene(QPointF(initialBox.rect.left(), initialBox.rect.center().y()),
+                                              session.layout(), session.snapshot(),
+                                              session.containerSelection(), canvas->zoom());
+    check(handleHit.type == edit::ContainerHitType::ContainerBorder,
+          "Top-level text container left edge must return ContainerBorder instead of ResizeHandleLeft");
+
+    // 按 Delete 键删除容器
+    sendKey(input, Qt::Key_Delete);
+    check(session.snapshot().root.children.empty(), "Container was not removed");
+    check(session.state().caret.containerId.isEmpty(), "Caret should be cleared when document is empty");
+    check(session.containerSelection().empty(), "Selection should be empty");
+
+    // 2. 测试分组删除与光标平移迁移
+    check(session.loadSnapshot(editor::testing::makeLayoutCase(QStringLiteral("09")).document),
+          "Failed to load case 09");
+    const auto& children = session.snapshot().root.children;
+    check(children.size() >= 2, "Expected multiple children in case 09");
+    const auto groupId = children[0].id;
+    const auto afterId = children[1].id;
+
+    // 选中分组并删除，验证级联删除子节点以及光标平移迁移到 afterId
+    session.selectContainer(groupId);
+    check(session.containerSelection().isSelected(groupId), "Expected group selected");
+
+    sendKey(input, Qt::Key_Delete);
+    check(session.snapshot().root.children.size() == 1, "Expected only after container remaining");
+    check(session.snapshot().root.children.front().id == afterId, "Expected after container to remain");
+    check(session.state().caret.containerId == afterId, "Caret should migrate to afterId");
+}
+
+void testPhase2Interactions(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    // 1. 测试添加顶层文本容器并立即获得输入焦点
+    check(session.newDocument(), "Failed to create new document");
+    const auto initialId = session.state().caret.containerId;
+    check(!initialId.isEmpty(), "Expected initial text container");
+
+    const auto addedId = session.addTextContainer({}, QStringLiteral("Second"));
+    check(addedId.has_value(), "Failed to add text container");
+    check(session.state().caret.containerId == *addedId, "Caret should be moved to new container");
+    check(session.state().caret.offset == 0, "Caret offset should be 0 in new container");
+
+    // 立即输入文字，验证焦点已在容器中且无需二次点击
+    sendKey(input, Qt::Key_A, {}, QStringLiteral("A"));
+    check(session.state().caret.containerId == *addedId, "Caret still in new container");
+    check(currentText(session).text.startsWith(QStringLiteral("A")), "Text should be inserted into new container");
+
+    // 2. 测试水平跨容器导航 (Left / Right)
+    // 当前光标在 *addedId 的 offset 1 处，按 Home 到 offset 0
+    sendKey(input, Qt::Key_Home);
+    check(session.state().caret.offset == 0, "Caret should be at start of container 2");
+
+    // 向左按键：应跨入前驱容器 initialId 的末尾
+    sendKey(input, Qt::Key_Left);
+    check(session.state().caret.containerId == initialId, "Caret should cross left to initial container");
+    check(session.state().caret.offset == edit::textLength(session.snapshot(), initialId),
+          "Caret should land at the end of initial container");
+
+    // 向右按键：应跨入后继容器 *addedId 的起始
+    sendKey(input, Qt::Key_Right);
+    check(session.state().caret.containerId == *addedId, "Caret should cross right back to second container");
+    check(session.state().caret.offset == 0, "Caret should land at 0");
+
+    // 3. 测试跨容器格式继承 (pendingCharStyle)
+    edit::EditAction boldAction;
+    boldAction.kind = edit::EditActionKind::SetCharFormat;
+    boldAction.charStyle.bold = true;
+    session.action(boldAction);
+    check(session.state().pendingCharStyle.has_value() && session.state().pendingCharStyle->bold == true,
+          "Expected pending bold style");
+
+    // 跨容器向左移动
+    sendKey(input, Qt::Key_Left);
+    check(session.state().caret.containerId == initialId, "Crossed left");
+    check(session.state().pendingCharStyle.has_value() && session.state().pendingCharStyle->bold == true,
+          "Pending bold style must be preserved across container jump");
+
+    // 4. 测试垂直跨容器导航 (Up / Down) 与 desiredCaretX 保持
+    // 此时光标在 initialId 末尾，按 Down
+    sendKey(input, Qt::Key_Down);
+    check(session.state().caret.containerId == *addedId, "Caret should cross down to second container");
+    check(session.state().desiredCaretX.has_value(), "desiredCaretX should be preserved");
+
+    // 5. 测试添加分组与子容器
+    const auto groupId = session.addGroupContainer({});
+    check(groupId.has_value(), "Failed to add group");
+    check(session.containerSelection().isSelected(*groupId), "New group should be selected");
+
+    const auto childTextId = session.addTextContainer(*groupId, QStringLiteral("Child"));
+    check(childTextId.has_value(), "Failed to add child text in group");
+    check(session.state().caret.containerId == *childTextId, "Caret should focus child container");
+
+    // 6. 测试撤销 / 重做 (Undo / Redo)
+    check(session.canUndo(), "Expected canUndo");
+    // 撤销添加 childText
+    sendKey(input, Qt::Key_Z, Qt::ControlModifier);
+    check(session.canRedo(), "Expected canRedo after undo");
+    // 重做添加 childText
+    sendKey(input, Qt::Key_Y, Qt::ControlModifier);
+    check(session.state().caret.containerId == *childTextId, "Redo should restore child text container");
+}
+
+void testPhase3Interactions(MainWindow& window, app::EditorSession& session, QWidget& input)
+{
+    auto* canvas = window.findChild<CanvasWidget*>();
+    check(canvas != nullptr, "Missing canvas widget");
+
+    // 1. 测试吸附对齐引擎 (SnapEngine)
+    check(session.newDocument(), "Failed to create new document");
+    const auto& contentRect = session.layout().contentRect;
+    const auto containerId = session.snapshot().root.children.front().id;
+
+    // 构造一个距离左页边距 2px 的测试矩形，阈值为 6px
+    QRectF testRect(contentRect.left() + 2.0, 100, 200, 150);
+    auto snapResult = edit::SnapEngine::snapMove(testRect, session.layout(), containerId, 6.0);
+    check(snapResult.snappedX, "Expected snap on X axis");
+    check(qAbs(snapResult.snappedTopLeft.x() - contentRect.left()) < 0.001, "Expected snap to left page content margin");
+    check(!snapResult.guidelines.empty(), "Expected guidelines generated by SnapEngine");
+    check(snapResult.guidelines.front().orientation == edit::GuidelineOrientation::Vertical,
+          "Expected vertical guideline on X snap");
+
+    // 2. 测试拖拽过程中的实时排版反馈 (Live Layout) 且不修改真实文档
+    const auto revBefore = session.snapshot().revision;
+    data::ContainerGeometry testGeo;
+    testGeo.position = QPointF(50, 50);
+    testGeo.width = 400;
+    session.updateLiveDragGeometry(containerId, testGeo);
+    check(session.isDragging(), "Expected isDragging during live drag");
+    check(session.snapshot().revision == revBefore, "Document revision must NOT change during live drag");
+    // 验证 layout 实时反映了候选几何
+    const auto liveBox = session.layout().containers.front();
+    check(liveBox.rect.left() == contentRect.left() + 50, "Live layout must reflect candidate position");
+
+    session.clearLiveDrag();
+    check(!session.isDragging(), "Live drag cleared");
+    check(session.snapshot().revision == revBefore, "Revision still unchanged after clearing live drag");
+
+    // 3. 验证正文顶层容器不可拉宽，而分组内子文本容器可通过右手柄拖拽改宽
+    const auto topTextBox = session.layout().containers.front();
+    session.selectContainer(containerId);
+    const QPointF topRightEdgeWidget = canvas->paperToWidget(QPointF(topTextBox.rect.right(), topTextBox.rect.center().y()));
+    const QPointF topDraggedRightWidget = canvas->paperToWidget(QPointF(topTextBox.rect.right() - 80, topTextBox.rect.center().y()));
+    sendMouse(input, QEvent::MouseButtonPress, topRightEdgeWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, topDraggedRightWidget, Qt::NoButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseButtonRelease, topDraggedRightWidget, Qt::LeftButton, Qt::NoButton);
+    check(session.snapshot().root.children.front().geometry.width == 0,
+          "Top-level text container width must remain unchanged on edge drag");
+
+    const auto resizeGroupId = session.addGroupContainer({});
+    check(resizeGroupId.has_value(), "Failed to add group for resize test");
+    const auto resizeChildId = session.addTextContainer(*resizeGroupId, QStringLiteral("Group Child Text"));
+    check(resizeChildId.has_value(), "Failed to add child text in group for resize test");
+    data::ContainerLayout childBoxBefore;
+    for (const auto& b : session.layout().containers) {
+        if (b.containerId == *resizeChildId) {
+            childBoxBefore = b;
+            break;
+        }
+    }
+    const auto revBeforeChildResize = session.snapshot().revision;
+    session.selectContainer(*resizeChildId);
+    const QPointF rightHandleCenter(childBoxBefore.rect.right(), childBoxBefore.rect.center().y());
+    const QPointF rightHandleWidget = canvas->paperToWidget(rightHandleCenter);
+    const QPointF draggedWidget = canvas->paperToWidget(rightHandleCenter - QPointF(80, 0));
+
+    // 按下手柄开始拖拽缩窄
+    sendMouse(input, QEvent::MouseButtonPress, rightHandleWidget, Qt::LeftButton, Qt::LeftButton);
+    // 移动手柄
+    sendMouse(input, QEvent::MouseMove, draggedWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Session should be in live dragging state during handle drag");
+    // 松开手柄提交
+    sendMouse(input, QEvent::MouseButtonRelease, draggedWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Dragging state finished after mouse release");
+    check(session.snapshot().revision > revBeforeChildResize, "Revision must advance after committed drag");
+
+    // 4. 测试撤销手柄调整
+    check(session.canUndo(), "Expected canUndo after resize");
+    sendKey(input, Qt::Key_Z, Qt::ControlModifier);
+    check(session.canRedo(), "Expected canRedo after undoing resize");
+
+    // 5. 测试浮动图片鼠标拖拽与实时绕排重排
+    check(session.loadSnapshot(editor::testing::makeLayoutCase(QStringLiteral("02")).document),
+          "Failed to load case 02 with floating image");
+    check(!session.layout().images.empty(), "Expected floating image in case 02");
+    const auto imageBoxBefore = session.layout().images.front().rect;
+    const auto imageId = session.layout().images.front().containerId;
+
+    // 鼠标点击图片中心开始拖拽
+    const QPointF imgCenter = imageBoxBefore.center();
+    const QPointF imgCenterWidget = canvas->paperToWidget(imgCenter);
+    const QPointF imgDraggedWidget = canvas->paperToWidget(imgCenter + QPointF(50, 40));
+
+    sendMouse(input, QEvent::MouseButtonPress, imgCenterWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, imgDraggedWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Session must be in live drag state during image drag");
+    // 验证排版中图片的实时位置已经移动
+    const auto imageBoxDuring = session.layout().images.front().rect;
+    check(imageBoxDuring.left() != imageBoxBefore.left(), "Image rect must update in live layout during drag");
+    check(!session.layout().textFragments.empty(), "Text fragments should be present");
+
+    // 松开鼠标提交
+    sendMouse(input, QEvent::MouseButtonRelease, imgDraggedWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Live drag finished after mouse release");
+    const auto imageBoxAfter = session.layout().images.front().rect;
+    check(imageBoxAfter.left() == imageBoxDuring.left(), "Committed image rect should match dropped position");
+
+    // 6. 测试容器上下移动与同级重排 (Container Vertical Movement & Sibling Reordering)
+    check(session.newDocument(), "Failed to create new doc for reordering test");
+    const auto topId = session.snapshot().root.children.front().id;
+    const auto bottomId = session.addTextContainer({}, QStringLiteral("Bottom Container"));
+    check(bottomId.has_value(), "Failed to add second container");
+    check(session.snapshot().root.children.size() == 2, "Expected 2 containers");
+    check(session.snapshot().root.children.front().id == topId, "Initial order: top first");
+    check(session.snapshot().root.children.back().id == *bottomId, "Initial order: bottom second");
+
+    const auto topBoxBefore = session.layout().containers.front();
+    const auto bottomBoxBefore = session.layout().containers.back();
+    check(bottomBoxBefore.rect.top() >= topBoxBefore.rect.bottom(), "Bottom box must initially be below top box");
+
+    // 点击 bottomBox 边框并向上拖拽超过 topBox
+    const QPointF bottomBorderPos(bottomBoxBefore.rect.left() + 1, bottomBoxBefore.rect.center().y());
+    const QPointF bottomBorderWidget = canvas->paperToWidget(bottomBorderPos);
+    // 拖动到 topBox 上方
+    const QPointF targetUpPos(bottomBoxBefore.rect.left() + 1, topBoxBefore.rect.top() - 20);
+    const QPointF targetUpWidget = canvas->paperToWidget(targetUpPos);
+
+    sendMouse(input, QEvent::MouseButtonPress, bottomBorderWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, targetUpWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Expected live drag while dragging container up");
+    // 验证实时排版中顺序已颠倒：bottomId 排在第一位
+    check(session.layout().containers.front().containerId == *bottomId, "Live layout must show bottom container moved to top");
+    // 松手提交
+    sendMouse(input, QEvent::MouseButtonRelease, targetUpWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Drag finished");
+    check(session.snapshot().root.children.front().id == *bottomId, "Document must have bottom container first now");
+    check(session.snapshot().root.children.back().id == topId, "Document must have top container second now");
+
+    // 6.2 测试容器向下移动 (Container Moving Down past sibling)
+    const auto topNowBox = session.layout().containers.front();
+    const auto bottomNowBox = session.layout().containers.back();
+    // 点击顶部边框（避开左右中心的手柄）
+    const QPointF topBorderPos(topNowBox.rect.center().x(), topNowBox.rect.top() + 1);
+    const QPointF topBorderWidget = canvas->paperToWidget(topBorderPos);
+    // 拖动到 bottomNowBox 下方
+    const QPointF targetDownPos(topNowBox.rect.center().x(), bottomNowBox.rect.bottom() + 40);
+    const QPointF targetDownWidget = canvas->paperToWidget(targetDownPos);
+
+    sendMouse(input, QEvent::MouseButtonPress, topBorderWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, targetDownWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Expected live drag while dragging container down");
+    // 验证实时排版中 topId 重新排到第一位
+    check(session.layout().containers.front().containerId == topId, "Live layout must show container moved down to bottom");
+    // 松手提交
+    sendMouse(input, QEvent::MouseButtonRelease, targetDownWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Drag finished");
+    check(session.snapshot().root.children.front().id == topId, "Document must have topId first again");
+    check(session.snapshot().root.children.back().id == *bottomId, "Document must have bottomId second again");
+
+    // 7. 测试跨容器迁移图片 (Move Floating Image across Containers)
+    check(session.loadSnapshot(editor::testing::makeLayoutCase(QStringLiteral("02")).document),
+          "Failed to load case 02 with floating image");
+    data::ContainerId srcTextId;
+    data::ContainerId imgNodeId;
+    for (const auto& c : session.snapshot().root.children) {
+        if (!c.children.empty()) {
+            srcTextId = c.id;
+            imgNodeId = c.children.front().id;
+            break;
+        }
+    }
+    check(!srcTextId.isEmpty() && !imgNodeId.isEmpty(), "Found source text and image in case 02");
+    // 添加第二个文本容器
+    const auto dstTextId = session.addTextContainer({}, QStringLiteral("Destination container with text for wrapping..."));
+    check(dstTextId.has_value(), "Failed to add destination container");
+
+    // 获取图片初始位置和目标容器位置
+    const auto imgBox = session.layout().images.front().rect;
+    QRectF dstContentRect;
+    for (const auto& b : session.layout().containers) {
+        if (b.containerId == *dstTextId) {
+            dstContentRect = b.contentRect;
+            break;
+        }
+    }
+    check(dstContentRect.isValid(), "Destination container content rect must be valid");
+
+    // 点击图片并拖拽到目标容器的 contentRect 内部
+    const QPointF imgPressPos = imgBox.center();
+    const QPointF imgPressWidget = canvas->paperToWidget(imgPressPos);
+    const QPointF imgTargetPos = dstContentRect.topLeft() + QPointF(20, 20);
+    const QPointF imgTargetWidget = canvas->paperToWidget(imgTargetPos);
+
+    sendMouse(input, QEvent::MouseButtonPress, imgPressWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, imgTargetWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Session must be dragging image across containers");
+
+    // 松手提交跨容器迁移
+    sendMouse(input, QEvent::MouseButtonRelease, imgTargetWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Image cross-container drag finished");
+
+    const auto findTestNode = [](auto& self, const data::ContainerNode& root, const data::ContainerId& id) -> const data::ContainerNode* {
+        if (root.id == id)
+            return &root;
+        for (const auto& child : root.children) {
+            if (const auto* found = self(self, child, id))
+                return found;
+        }
+        return nullptr;
+    };
+
+    // 验证快照中文档节点关系：源文本容器不再拥有该图片，目标文本容器拥有该图片
+    const auto* srcNodeAfter = findTestNode(findTestNode, session.snapshot().root, srcTextId);
+    const auto* dstNodeAfter = findTestNode(findTestNode, session.snapshot().root, *dstTextId);
+    check(srcNodeAfter != nullptr && srcNodeAfter->children.empty(), "Source container must not have image anymore");
+    check(dstNodeAfter != nullptr && !dstNodeAfter->children.empty(), "Destination container must now have image");
+    check(dstNodeAfter->children.front().id == imgNodeId, "Moved image ID must match");
+
+    // 测试撤销：图片应该回到源文本容器
+    check(session.canUndo(), "Expected canUndo after cross container image move");
+    session.undo();
+    const auto* srcNodeUndo = findTestNode(findTestNode, session.snapshot().root, srcTextId);
+    const auto* dstNodeUndo = findTestNode(findTestNode, session.snapshot().root, *dstTextId);
+    check(srcNodeUndo != nullptr && !srcNodeUndo->children.empty(), "Source container must have image back after undo");
+    check(dstNodeUndo != nullptr && dstNodeUndo->children.empty(), "Destination container must be empty of images after undo");
+
+    // 8. 测试浮动图片右下角手柄等比例缩放、实时绕排重排与 Undo/Redo
+    check(session.loadSnapshot(editor::testing::makeLayoutCase(QStringLiteral("02")).document),
+          "Failed to load case 02 for image resize test");
+    data::ContainerId resizeImgId;
+    QRectF imgFrameBefore;
+    for (const auto& img : session.layout().images) {
+        resizeImgId = img.containerId;
+        for (const auto& box : session.layout().containers) {
+            if (box.containerId == resizeImgId) {
+                imgFrameBefore = box.rect;
+                break;
+            }
+        }
+        break;
+    }
+    check(!resizeImgId.isEmpty() && imgFrameBefore.isValid(), "Expected valid image frame before resize");
+    const auto* imgNodeBefore = findTestNode(findTestNode, session.snapshot().root, resizeImgId);
+    check(imgNodeBefore != nullptr, "Missing image node before resize");
+    const QSizeF imgDispBefore = imgNodeBefore->image.displaySize;
+    const auto revImgBefore = session.snapshot().revision;
+
+    // 单击选中浮动图片以激活 8 手柄
+    clickAt(input, canvas->paperToWidget(imgFrameBefore.center()));
+    check(session.containerSelection().isSelected(resizeImgId), "Image must be selected after click");
+
+    // 按住右下角手柄拖拽放大 (+40, +20) -> 保持等比例
+    const QPointF brHandleWidget = canvas->paperToWidget(imgFrameBefore.bottomRight());
+    const QPointF brDraggedWidget = canvas->paperToWidget(imgFrameBefore.bottomRight() + QPointF(40, 20));
+    sendMouse(input, QEvent::MouseButtonPress, brHandleWidget, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, brDraggedWidget, Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Session must enter live drag during corner image resize");
+
+    const QRectF liveImgRect = session.layout().images.front().rect;
+    check(liveImgRect.width() > imgDispBefore.width() + 20.0 && liveImgRect.height() > imgDispBefore.height() + 10.0,
+          "Live image layout must reflect enlarged display size");
+    const qreal origRatio = imgDispBefore.width() / imgDispBefore.height();
+    const qreal liveRatio = liveImgRect.width() / liveImgRect.height();
+    check(qAbs(origRatio - liveRatio) < 0.05, "Corner resize without Shift must preserve aspect ratio");
+    for (const auto& frag : session.layout().textFragments) {
+        if (frag.containerId == resizeImgId)
+            continue;
+        // 文本片段不得与放大后的图片框重叠
+        check(!frag.rect.intersects(liveImgRect), "Reflowed text fragments must avoid enlarged live image");
+    }
+
+    sendMouse(input, QEvent::MouseButtonRelease, brDraggedWidget, Qt::LeftButton, Qt::NoButton);
+    check(!session.isDragging(), "Live drag must stop after image resize release");
+    check(session.snapshot().revision > revImgBefore, "Document revision must increment on image resize commit");
+    const QSizeF imgDispAfter = findTestNode(findTestNode, session.snapshot().root, resizeImgId)->image.displaySize;
+    check(qAbs(imgDispAfter.width() - liveImgRect.width()) < 0.5 &&
+          qAbs(imgDispAfter.height() - liveImgRect.height()) < 0.5,
+          "Committed displaySize must match live preview dimensions");
+
+    // 撤销与重做验证
+    check(session.undo(), "Undo after image resize must succeed");
+    const QSizeF imgDispUndo = findTestNode(findTestNode, session.snapshot().root, resizeImgId)->image.displaySize;
+    check(qAbs(imgDispUndo.width() - imgDispBefore.width()) < 0.5 &&
+          qAbs(imgDispUndo.height() - imgDispBefore.height()) < 0.5,
+          "Undo must restore original image displaySize");
+    check(session.redo(), "Redo after image resize must succeed");
+    const QSizeF imgDispRedo = findTestNode(findTestNode, session.snapshot().root, resizeImgId)->image.displaySize;
+    check(qAbs(imgDispRedo.width() - imgDispAfter.width()) < 0.5,
+          "Redo must reapply resized image displaySize");
+
+    // 9. 测试图片右中点边手柄单轴缩窄（高度保持不变）
+    QRectF imgFrameAfterResize;
+    for (const auto& box : session.layout().containers) {
+        if (box.containerId == resizeImgId) {
+            imgFrameAfterResize = box.rect;
+            break;
+        }
+    }
+    // redo() 会清空容器选中状态，先重新单击选中图片以显示手柄
+    clickAt(input, canvas->paperToWidget(imgFrameAfterResize.center()));
+    check(session.containerSelection().isSelected(resizeImgId), "Image must be selected before edge handle resize");
+    const QSizeF sizeBeforeEdge = findTestNode(findTestNode, session.snapshot().root, resizeImgId)->image.displaySize;
+    const QPointF rightEdgeHandle = canvas->paperToWidget(QPointF(imgFrameAfterResize.right(), imgFrameAfterResize.center().y()));
+    const QPointF rightEdgeDragged = canvas->paperToWidget(QPointF(imgFrameAfterResize.right() - 30.0, imgFrameAfterResize.center().y()));
+    sendMouse(input, QEvent::MouseButtonPress, rightEdgeHandle, Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, rightEdgeDragged, Qt::NoButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseButtonRelease, rightEdgeDragged, Qt::LeftButton, Qt::NoButton);
+    const QSizeF sizeAfterEdge = findTestNode(findTestNode, session.snapshot().root, resizeImgId)->image.displaySize;
+    check(sizeAfterEdge.width() < sizeBeforeEdge.width() - 20.0 &&
+          qAbs(sizeAfterEdge.height() - sizeBeforeEdge.height()) < 0.5,
+          "Right edge handle resize must change width while keeping height constant");
+
+    // 10. 测试顶层流式图片 (Flow Image) 缩放
+    data::DocumentSnapshot flowDoc;
+    flowDoc.page.size = QSizeF(760, 1000);
+    flowDoc.page.margins = QMarginsF(44, 44, 44, 44);
+    QImage sampleImg(160, 100, QImage::Format_RGB32);
+    sampleImg.fill(Qt::darkBlue);
+    flowDoc.resources.insert(QStringLiteral("flow-res"), sampleImg);
+    data::ContainerNode flowImgNode;
+    flowImgNode.id = QStringLiteral("flow-img-1");
+    flowImgNode.type = data::ContainerType::Image;
+    flowImgNode.placement = data::PlacementMode::Flow;
+    flowImgNode.image = {QStringLiteral("flow-res"), QSizeF(160, 100)};
+    data::ContainerNode flowTextNode;
+    flowTextNode.id = QStringLiteral("flow-text-1");
+    flowTextNode.type = data::ContainerType::Text;
+    flowTextNode.placement = data::PlacementMode::Flow;
+    flowTextNode.text.text = QStringLiteral("Below flow image");
+    flowTextNode.text.paragraphs = {{{0, 16}, data::ParagraphRole::Body, 1, {}, {}}};
+    flowDoc.root.children = {flowImgNode, flowTextNode};
+    check(session.loadSnapshot(flowDoc), "Failed to load flow image snapshot");
+
+    const QRectF flowBoxBefore = session.layout().containers.front().rect;
+    clickAt(input, canvas->paperToWidget(flowBoxBefore.center()));
+    check(session.containerSelection().isSelected(QStringLiteral("flow-img-1")), "Flow image must be selectable");
+    sendMouse(input, QEvent::MouseButtonPress, canvas->paperToWidget(flowBoxBefore.bottomRight()), Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, canvas->paperToWidget(flowBoxBefore.bottomRight() + QPointF(48, 30)), Qt::NoButton, Qt::LeftButton);
+    check(session.isDragging(), "Flow image resize must trigger live drag");
+    sendMouse(input, QEvent::MouseButtonRelease, canvas->paperToWidget(flowBoxBefore.bottomRight() + QPointF(48, 30)), Qt::LeftButton, Qt::NoButton);
+    const QSizeF flowSizeAfter = findTestNode(findTestNode, session.snapshot().root, QStringLiteral("flow-img-1"))->image.displaySize;
+    check(flowSizeAfter.width() > 200.0 && flowSizeAfter.height() > 120.0,
+          "Flow image displaySize must grow on corner resize commit");
+
+    // 11. 测试分组内子文本容器左手柄调整宽度并保持右边距锚定
+    check(session.newDocument(), "Failed to reset document for left handle test");
+    const auto leftResizeGroupId = session.addGroupContainer({});
+    check(leftResizeGroupId.has_value(), "Failed to add group for left handle test");
+    const auto narrowId = session.addTextContainer(*leftResizeGroupId, QStringLiteral("Narrow child text"));
+    check(narrowId.has_value(), "Failed to add child text for left handle test");
+    data::ContainerGeometry narrowGeo;
+    narrowGeo.position = QPointF(120, 0);
+    narrowGeo.width = 300;
+    check(session.commitContainerGeometry(*narrowId, narrowGeo), "Failed to set narrow container geometry");
+    session.selectContainer(*narrowId);
+    data::ContainerLayout narrowBoxBeforeLayout;
+    for (const auto& b : session.layout().containers) {
+        if (b.containerId == *narrowId) {
+            narrowBoxBeforeLayout = b;
+            break;
+        }
+    }
+    const QRectF narrowBoxBefore = narrowBoxBeforeLayout.rect;
+    const QPointF leftHandlePos(narrowBoxBefore.left(), narrowBoxBefore.center().y());
+    const QPointF leftDraggedPos = leftHandlePos - QPointF(40, 0);
+    sendMouse(input, QEvent::MouseButtonPress, canvas->paperToWidget(leftHandlePos), Qt::LeftButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseMove, canvas->paperToWidget(leftDraggedPos), Qt::NoButton, Qt::LeftButton);
+    sendMouse(input, QEvent::MouseButtonRelease, canvas->paperToWidget(leftDraggedPos), Qt::LeftButton, Qt::NoButton);
+    QRectF narrowBoxAfter;
+    for (const auto& b : session.layout().containers) {
+        if (b.containerId == *narrowId) {
+            narrowBoxAfter = b.rect;
+            break;
+        }
+    }
+    check(qAbs(narrowBoxAfter.right() - narrowBoxBefore.right()) < 1.0 &&
+          narrowBoxAfter.width() > 335.0 &&
+          narrowBoxAfter.left() < narrowBoxBefore.left() - 35.0,
+          "Left handle drag on child text container must expand width leftward while keeping right edge anchored");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -553,6 +1051,9 @@ int main(int argc, char** argv)
     testRejectedBatch();
     testInsertImages(window, session, *input, output);
     testRealLayouts(window, session, *input, output);
+    testContainerSelectionAndDeletion(window, session, *input);
+    testPhase2Interactions(window, session, *input);
+    testPhase3Interactions(window, session, *input);
     check(session.newDocument() &&
           session.exportTo(output.filePath(QStringLiteral("missing/failure.docx"))).status == io::DocxExportStatus::IoError,
           "An invalid export path must return an IO error");

@@ -226,28 +226,39 @@ void EditorIntegration::refresh(bool layoutChanged)
 {
     if (layoutChanged)
         window_.updateLayoutData(session_.snapshot(), session_.layout());
-    if (caret_)
-        caret_->setText(QStringLiteral("光标：%1").arg(session_.state().caret.offset));
-    refreshToolbar();
-    if (const auto rect = input_->cursorRectangle(); input_->hasFocus() && rect.isValid()) {
-        const auto point = rect.center().toPoint();
-        scroll_->ensureVisible(point.x(), point.y(), 16, 16);
+    const bool dragging = session_.isDragging();
+    if (!dragging) {
+        if (caret_)
+            caret_->setText(QStringLiteral("光标：%1").arg(session_.state().caret.offset));
+        refreshToolbar();
+        if (const auto rect = input_->cursorRectangle(); input_->hasFocus() && rect.isValid()) {
+            const auto point = rect.center().toPoint();
+            scroll_->ensureVisible(point.x(), point.y(), 16, 16);
+        }
     }
     input_->update();
-    input_->refreshInputMethod();
+    if (!dragging) {
+        input_->refreshInputMethod();
+    }
 }
 
 void EditorIntegration::refreshToolbar()
 {
     const auto style = session_.currentStyle();
-    const QSignalBlocker fontBlocker(font_);
-    const QSignalBlocker sizeBlocker(size_);
-    const QSignalBlocker paragraphBlocker(paragraph_);
-    font_->setCurrentFont(QFont(style.fontFamily));
-    size_->setValue(style.fontSizePt);
-    bold_->setChecked(style.bold);
-    italic_->setChecked(style.italic);
-    underline_->setChecked(style.underline);
+    if (font_->currentFont().family() != style.fontFamily) {
+        const QSignalBlocker fontBlocker(font_);
+        font_->setCurrentFont(QFont(style.fontFamily));
+    }
+    if (!qFuzzyCompare(size_->value(), style.fontSizePt)) {
+        const QSignalBlocker sizeBlocker(size_);
+        size_->setValue(style.fontSizePt);
+    }
+    if (bold_->isChecked() != style.bold)
+        bold_->setChecked(style.bold);
+    if (italic_->isChecked() != style.italic)
+        italic_->setChecked(style.italic);
+    if (underline_->isChecked() != style.underline)
+        underline_->setChecked(style.underline);
 
     int level = 0;
     if (const auto* paragraph = session_.currentParagraph()) {
@@ -256,7 +267,11 @@ void EditorIntegration::refreshToolbar()
         if (paragraph->role == data::ParagraphRole::Heading)
             level = paragraph->headingLevel;
     }
-    paragraph_->setCurrentIndex(paragraph_->findData(level));
+    const int targetIndex = paragraph_->findData(level);
+    if (paragraph_->currentIndex() != targetIndex) {
+        const QSignalBlocker paragraphBlocker(paragraph_);
+        paragraph_->setCurrentIndex(targetIndex);
+    }
 }
 
 void EditorIntegration::setCharStyle(const data::TextStyleOverride& style)

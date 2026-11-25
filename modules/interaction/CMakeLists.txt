@@ -2,12 +2,21 @@
 add_library(EditorInteraction STATIC
     InteractionModule.cpp
     InteractionTypes.h
+    ContainerInteractionTypes.h
+    ContainerHitTest.h
+    ContainerHitTest.cpp
     HitTest.h
     HitTest.cpp
     TextBoundary.h
     TextBoundary.cpp
     Selection.h
     Selection.cpp
+    CrossContainerCursor.h
+    CrossContainerCursor.cpp
+    SnapEngine.h
+    SnapEngine.cpp
+    ContainerDragEngine.h
+    ContainerDragEngine.cpp
     InteractionController.h
     InteractionController.cpp
 )

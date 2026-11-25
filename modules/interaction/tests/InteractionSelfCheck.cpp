@@ -6,6 +6,8 @@
 #include "InteractionController.h"
 #include "Selection.h"
 #include "TextBoundary.h"
+#include "ContainerDragEngine.h"
+#include "ContainerHitTest.h"
 #include "TestFixtures.h"
 
 #include <QGuiApplication>
@@ -897,6 +899,238 @@ static void testInteractionRegressions()
           QStringLiteral("blank click below the right-hand box picks that container"));
 }
 
+static void testContainerDragEngine()
+{
+    out << "\n=== ContainerDragEngine: drag drop planning ===\n";
+
+    // 构造测试快照：根节点包含 2 个文本容器
+    ed::DocumentSnapshot doc;
+    doc.root.id = QStringLiteral("root");
+    doc.root.type = ed::ContainerType::Group;
+    doc.page.size = QSizeF(800, 1000);
+    doc.page.margins = QMarginsF(50, 50, 50, 50);
+
+    ed::ContainerNode textA;
+    textA.id = QStringLiteral("textA");
+    textA.type = ed::ContainerType::Text;
+    textA.placement = ed::PlacementMode::Flow;
+    textA.geometry.width = 600;
+
+    ed::ContainerNode textB;
+    textB.id = QStringLiteral("textB");
+    textB.type = ed::ContainerType::Text;
+    textB.placement = ed::PlacementMode::Flow;
+    textB.geometry.width = 600;
+
+    doc.root.children = {textA, textB};
+
+    // 构造基础排版：textA 在 y=50..150 (center 100), textB 在 y=160..260 (center 210)
+    ed::LayoutResult baseLayout;
+    baseLayout.contentRect = QRectF(50, 50, 700, 900);
+
+    ed::ContainerLayout boxA;
+    boxA.containerId = QStringLiteral("textA");
+    boxA.parentId = QStringLiteral("root");
+    boxA.rect = QRectF(50, 50, 600, 100);
+    boxA.contentRect = boxA.rect;
+
+    ed::ContainerLayout boxB;
+    boxB.containerId = QStringLiteral("textB");
+    boxB.parentId = QStringLiteral("root");
+    boxB.rect = QRectF(50, 160, 600, 100);
+    boxB.contentRect = boxB.rect;
+
+    baseLayout.containers = {boxA, boxB};
+
+    // 1. 测试容器向下移动 (textA 往下挪越过 textB)
+    const QRectF initialRectA = boxA.rect;
+    const QPointF deltaDown(0, 150); // y: 50 -> 200, center: 100 -> 250 (> 210)
+    const QPointF paperPosDown(300, 250);
+    auto planDown = ei::ContainerDragEngine::planContainerMove(
+        QStringLiteral("textA"), ed::ContainerType::Text,
+        initialRectA, deltaDown, paperPosDown, baseLayout, doc);
+
+    check(planDown.targetIndex == 1, QStringLiteral("textA moving down past textB targets index 1"));
+    check(planDown.targetParentId == QStringLiteral("root"), QStringLiteral("textA targets root parent"));
+    check(planDown.placementMode == ed::PlacementMode::Flow, QStringLiteral("placement is Flow"));
+
+    // 2. 测试容器向上移动 (textB 往上挪越过 textA)
+    const QRectF initialRectB = boxB.rect;
+    const QPointF deltaUp(0, -130); // y: 160 -> 30, center: 210 -> 80 (< 100)
+    const QPointF paperPosUp(300, 80);
+    auto planUp = ei::ContainerDragEngine::planContainerMove(
+        QStringLiteral("textB"), ed::ContainerType::Text,
+        initialRectB, deltaUp, paperPosUp, baseLayout, doc);
+
+    check(planUp.targetIndex == 0, QStringLiteral("textB moving up past textA targets index 0"));
+    check(planUp.targetParentId == QStringLiteral("root"), QStringLiteral("textB targets root parent"));
+
+    // 3. 测试图片跨容器迁移规划
+    ed::ContainerNode imgNode;
+    imgNode.id = QStringLiteral("img1");
+    imgNode.type = ed::ContainerType::Image;
+    imgNode.placement = ed::PlacementMode::Floating;
+    imgNode.image.displaySize = QSizeF(80, 80);
+    doc.root.children.front().children = {imgNode};
+
+    ed::ImageLayout imgLayout;
+    imgLayout.containerId = QStringLiteral("img1");
+    imgLayout.rect = QRectF(60, 60, 80, 80);
+    baseLayout.images = {imgLayout};
+
+    // 将图片拖入 textB 的内容区 (y=180, x=100)
+    const QRectF imgInitialRect(60, 60, 80, 80);
+    const QPointF imgDelta(40, 120); // y: 60 -> 180 (inside textB's 160..260)
+    const QPointF imgPaper(100, 180);
+    auto imgPlan = ei::ContainerDragEngine::planImageMove(
+        QStringLiteral("img1"), QStringLiteral("textA"),
+        imgInitialRect, imgDelta, imgPaper, baseLayout, doc);
+
+    check(imgPlan.targetParentId == QStringLiteral("textB"), QStringLiteral("img1 correctly detects textB as target"));
+    check(imgPlan.placementMode == ed::PlacementMode::Floating, QStringLiteral("img1 placement mode is Floating"));
+
+    // 4. 测试候选快照变更应用 (applyPlanToCandidateSnapshot)
+    auto candidate = doc;
+    bool applied = ei::ContainerDragEngine::applyPlanToCandidateSnapshot(
+        candidate, QStringLiteral("img1"), imgPlan, imgNode.geometry);
+    check(applied, QStringLiteral("applyPlanToCandidateSnapshot succeeded"));
+    check(candidate.root.children.front().children.empty(), QStringLiteral("textA no longer has img1"));
+    check(!candidate.root.children.back().children.empty(), QStringLiteral("textB now has img1"));
+    check(candidate.root.children.back().children.front().id == QStringLiteral("img1"), QStringLiteral("textB child is img1"));
+
+    // 5. 测试高文本容器前沿阈值重排（无 100px+ 死区阻滞）与全宽 X/Y 夹紧
+    ed::DocumentSnapshot tallDoc = doc;
+    tallDoc.root.children[0].children.clear();
+    tallDoc.root.children[0].geometry.width = 0; // 全宽容器
+    tallDoc.root.children[1].geometry.width = 0;
+    ed::LayoutResult tallLayout;
+    tallLayout.contentRect = QRectF(50, 50, 700, 900);
+    ed::ContainerLayout tallA{QStringLiteral("textA"), QStringLiteral("root"), QRectF(50, 50, 700, 200), QRectF(50, 50, 700, 200), QRectF(50, 50, 700, 200)};
+    ed::ContainerLayout tallB{QStringLiteral("textB"), QStringLiteral("root"), QRectF(50, 250, 700, 200), QRectF(50, 250, 700, 200), QRectF(50, 250, 700, 200)};
+    tallLayout.containers = {tallA, tallB};
+
+    // 拖动 tallA 向下仅 45px（远小于中心点跨距 200px，但越过 36px 前沿阈值）且伴随向右偏移 +60px
+    auto tallPlan = ei::ContainerDragEngine::planContainerMove(
+        QStringLiteral("textA"), ed::ContainerType::Text,
+        tallA.rect, QPointF(60, 45), QPointF(300, 150), tallLayout, tallDoc, 1.0);
+    check(tallPlan.targetIndex == 1, QStringLiteral("tall container swaps downward immediately past 36px threshold"));
+    check(tallPlan.localPosition.x() == 0 && tallPlan.localPosition.y() == 0,
+          QStringLiteral("full-width container stays clamped at x=0 and resets y=0 on reorder"));
+    check(tallPlan.insertionIndicator.has_value(), QStringLiteral("insertion indicator is computed for reorder"));
+
+    // 6. 测试图片 8 手柄命中测试与边缘不误判为 ContainerBorder
+    ed::ContainerLayout imgBox;
+    imgBox.containerId = QStringLiteral("img1");
+    imgBox.parentId = QStringLiteral("textA");
+    imgBox.rect = QRectF(60, 60, 80, 80);
+    imgBox.contentRect = imgBox.rect;
+    baseLayout.containers.push_back(imgBox);
+
+    ei::ContainerSelectionState emptySel;
+    const auto edgeHit = ei::hitTestScene(QPointF(61, 100), baseLayout, doc, emptySel, 1.0);
+    check(edgeHit.type == ei::ContainerHitType::FloatingImage,
+          QStringLiteral("clicking near unselected image edge hits FloatingImage instead of ContainerBorder"));
+
+    ei::ContainerSelectionState imgSel;
+    imgSel.select(QStringLiteral("img1"));
+    const auto cornerHit = ei::hitTestScene(QPointF(140, 140), baseLayout, doc, imgSel, 1.0);
+    check(cornerHit.type == ei::ContainerHitType::ResizeHandleBottomRight &&
+          cornerHit.containerId == QStringLiteral("img1"),
+          QStringLiteral("hitTestScene detects ResizeHandleBottomRight on selected image"));
+    const auto topHit = ei::hitTestScene(QPointF(100, 60), baseLayout, doc, imgSel, 1.0);
+    check(topHit.type == ei::ContainerHitType::ResizeHandleTop &&
+          topHit.containerId == QStringLiteral("img1"),
+          QStringLiteral("hitTestScene detects ResizeHandleTop on selected image"));
+
+    // 7. 测试图片等比例角缩放、单边拉伸及最小尺寸保护
+    const QRectF parentContent(50, 50, 600, 400);
+    auto cornerResizePlan = ei::ContainerDragEngine::planImageResize(
+        QStringLiteral("img1"), ei::ContainerHitType::ResizeHandleBottomRight,
+        imgBox.rect, QSizeF(80, 80), imgNode.geometry,
+        QPointF(40, 20), parentContent, baseLayout, /*keepAspectRatio=*/true, 1.0);
+    check(cornerResizePlan.targetDisplaySize.has_value() &&
+          std::abs(cornerResizePlan.targetDisplaySize->width() - 120.0) < 0.01 &&
+          std::abs(cornerResizePlan.targetDisplaySize->height() - 120.0) < 0.01,
+          QStringLiteral("corner image resize scales proportionally to 120x120"));
+
+    auto edgeResizePlan = ei::ContainerDragEngine::planImageResize(
+        QStringLiteral("img1"), ei::ContainerHitType::ResizeHandleRight,
+        imgBox.rect, QSizeF(80, 80), imgNode.geometry,
+        QPointF(-20, 15), parentContent, baseLayout, /*keepAspectRatio=*/false, 1.0);
+    check(edgeResizePlan.targetDisplaySize.has_value() &&
+          std::abs(edgeResizePlan.targetDisplaySize->width() - 60.0) < 0.01 &&
+          std::abs(edgeResizePlan.targetDisplaySize->height() - 80.0) < 0.01,
+          QStringLiteral("right edge resize shrinks width to 60 while keeping height 80"));
+
+    auto minClampPlan = ei::ContainerDragEngine::planImageResize(
+        QStringLiteral("img1"), ei::ContainerHitType::ResizeHandleBottomRight,
+        imgBox.rect, QSizeF(80, 80), imgNode.geometry,
+        QPointF(-200, -200), parentContent, baseLayout, /*keepAspectRatio=*/true, 1.0);
+    check(minClampPlan.targetDisplaySize.has_value() &&
+          minClampPlan.targetDisplaySize->width() >= 24.0 &&
+          minClampPlan.targetDisplaySize->height() >= 24.0,
+          QStringLiteral("image resize clamps to minimum 24x24 display size"));
+
+    auto imgCandidate = doc;
+    check(ei::ContainerDragEngine::applyPlanToCandidateSnapshot(
+              imgCandidate, QStringLiteral("img1"), cornerResizePlan, imgNode.geometry) &&
+          std::abs(imgCandidate.root.children.front().children.front().image.displaySize.width() - 120.0) < 0.01,
+          QStringLiteral("applyPlanToCandidateSnapshot updates image displaySize"));
+
+    // 8. 测试 SnapEngine 拖动父容器时不会与自身子图片产生自吸附
+    const QRectF selfSnapProbe(60, 50, 600, 100); // left=60 正好等于 child img1.left()
+    auto selfSnap = ei::SnapEngine::snapMove(selfSnapProbe, baseLayout, QStringLiteral("textA"), 4.0, true);
+    check(!selfSnap.snappedX || std::abs(selfSnap.snappedTopLeft.x() - 60.0) > 0.01,
+          QStringLiteral("SnapEngine ignores child images of the dragged container"));
+
+    // 9. 测试正文顶层容器不暴露左右改宽手柄，而 Group 与 Group 内子文本保留左右改宽手柄
+    ei::ContainerSelectionState topTextSel;
+    topTextSel.select(QStringLiteral("textA"));
+    const auto topTextLeftHit = ei::hitTestScene(QPointF(boxA.rect.left(), boxA.rect.center().y()),
+                                                 baseLayout, doc, topTextSel, 1.0);
+    const auto topTextRightHit = ei::hitTestScene(QPointF(boxA.rect.right(), boxA.rect.center().y()),
+                                                  baseLayout, doc, topTextSel, 1.0);
+    check(topTextLeftHit.type == ei::ContainerHitType::ContainerBorder &&
+          topTextRightHit.type == ei::ContainerHitType::ContainerBorder,
+          QStringLiteral("top-level text container edges return ContainerBorder instead of resize handles"));
+
+    ed::DocumentSnapshot groupDoc = doc;
+    ed::ContainerNode grp;
+    grp.id = QStringLiteral("grp1");
+    grp.type = ed::ContainerType::Group;
+    grp.placement = ed::PlacementMode::Flow;
+    ed::ContainerNode subText;
+    subText.id = QStringLiteral("subText");
+    subText.type = ed::ContainerType::Text;
+    subText.placement = ed::PlacementMode::Flow;
+    grp.children = {subText};
+    groupDoc.root.children.push_back(grp);
+
+    ed::LayoutResult groupLayout = baseLayout;
+    ed::ContainerLayout grpBox{QStringLiteral("grp1"), QStringLiteral("root"),
+                               QRectF(50, 280, 600, 120), QRectF(50, 280, 600, 120), QRectF(50, 280, 600, 120)};
+    ed::ContainerLayout subBox{QStringLiteral("subText"), QStringLiteral("grp1"),
+                               QRectF(60, 290, 500, 80), QRectF(60, 290, 500, 80), QRectF(60, 290, 500, 80)};
+    groupLayout.containers.push_back(grpBox);
+    groupLayout.containers.push_back(subBox);
+
+    ei::ContainerSelectionState grpSel;
+    grpSel.select(QStringLiteral("grp1"));
+    check(ei::hitTestScene(QPointF(grpBox.rect.left(), grpBox.rect.center().y()), groupLayout, groupDoc, grpSel, 1.0).type ==
+          ei::ContainerHitType::ResizeHandleLeft &&
+          ei::hitTestScene(QPointF(grpBox.rect.right(), grpBox.rect.center().y()), groupLayout, groupDoc, grpSel, 1.0).type ==
+          ei::ContainerHitType::ResizeHandleRight,
+          QStringLiteral("Group container retains left and right resize handles"));
+
+    ei::ContainerSelectionState subSel;
+    subSel.select(QStringLiteral("subText"));
+    check(ei::hitTestScene(QPointF(subBox.rect.left(), subBox.rect.center().y()), groupLayout, groupDoc, subSel, 1.0).type ==
+          ei::ContainerHitType::ResizeHandleLeft &&
+          ei::hitTestScene(QPointF(subBox.rect.right(), subBox.rect.center().y()), groupLayout, groupDoc, subSel, 1.0).type ==
+          ei::ContainerHitType::ResizeHandleRight,
+          QStringLiteral("child text container inside Group retains left and right resize handles"));
+}
+
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
@@ -910,6 +1144,7 @@ int main(int argc, char** argv)
     testToolbarFormatting();
     testController();
     testInteractionRegressions();
+    testContainerDragEngine();
 
     out << "\n===== Interaction self-check: ";
     if (failures == 0)

@@ -1,6 +1,7 @@
 #include "EditorSession.h"
 
 #include "DocxExporter.h"
+#include "CrossContainerCursor.h"
 #include "InteractionController.h"
 #include "LayoutModule.h"
 #include "Selection.h"
@@ -10,6 +11,7 @@
 #include <QImageReader>
 #include <QSaveFile>
 #include <algorithm>
+#include <cmath>
 #include <utility>
 #include <QDebug>
 
@@ -29,6 +31,14 @@ data::ContainerId firstTextId(const data::ContainerNode& node)
             return id;
     }
     return {};
+}
+
+void collectTextContainers(const data::ContainerNode& node, std::vector<data::ContainerId>& out)
+{
+    if (node.type == data::ContainerType::Text)
+        out.push_back(node.id);
+    for (const auto& child : node.children)
+        collectTextContainers(child, out);
 }
 
 const data::ParagraphInfo* paragraphAt(const data::TextContent& text, int offset)
@@ -100,6 +110,8 @@ QSize imageSize(const QString& path)
 
 EditorSession::EditorSession(QObject* parent) : QObject(parent)
 {
+    liveDragFlushTimer_.setSingleShot(true);
+    connect(&liveDragFlushTimer_, &QTimer::timeout, this, &EditorSession::flushPendingLiveDrag);
     newDocument();
 }
 
@@ -138,12 +150,245 @@ bool EditorSession::loadSnapshot(const data::DocumentSnapshot& snapshot)
 
 void EditorSession::startDocument(document::Document document, const data::ContainerId& textId)
 {
+    stopLiveDragTimer();
+    liveDragSnapshot_.reset();
+    liveDragLayout_.reset();
     setLayoutSnapshot(document.toSnapshot());
-    state_ = interaction::makeInitialState(snapshot_, layout_, textId);
+    if (!textId.isEmpty())
+        state_ = interaction::makeInitialState(snapshot_, layout_, textId);
+    else
+        state_ = interaction::InteractionState{};
+    containerSelection_.clear();
     dragAnchor_.reset();
     document_ = std::move(document);
     importedImages_.clear();
+    emit containerSelectionChanged();
     emit changed(true);
+}
+
+void EditorSession::selectContainer(const data::ContainerId& id, bool multi)
+{
+    containerSelection_.select(id, multi);
+    // 选中容器时，折叠文字选区
+    state_.selection.reset();
+    state_.selectionAnchor.reset();
+    emit containerSelectionChanged();
+    emit changed(false);
+}
+
+void EditorSession::clearContainerSelection()
+{
+    if (!containerSelection_.empty()) {
+        containerSelection_.clear();
+        emit containerSelectionChanged();
+        emit changed(false);
+    }
+}
+
+bool EditorSession::removeSelectedContainers()
+{
+    if (containerSelection_.empty())
+        return false;
+
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+
+    std::vector<data::ContainerId> textOrderBefore;
+    collectTextContainers(snapshot_.root, textOrderBefore);
+
+    const auto toDelete = containerSelection_.selectedIds;
+    const auto currentCaretContainer = state_.caret.containerId;
+    containerSelection_.clear();
+
+    for (const auto& id : toDelete) {
+        document_.removeNode(id);
+    }
+
+    auto newSnapshot = document_.toSnapshot();
+    std::vector<data::ContainerId> textOrderAfter;
+    collectTextContainers(newSnapshot.root, textOrderAfter);
+
+    const bool caretDeleted = std::find(textOrderAfter.begin(), textOrderAfter.end(), currentCaretContainer) == textOrderAfter.end();
+
+    setLayoutSnapshot(std::move(newSnapshot));
+
+    if (textOrderAfter.empty()) {
+        state_ = interaction::InteractionState{};
+    } else if (caretDeleted) {
+        auto it = std::find(textOrderBefore.begin(), textOrderBefore.end(), currentCaretContainer);
+        const int deletedIdx = it != textOrderBefore.end() ? static_cast<int>(std::distance(textOrderBefore.begin(), it)) : 0;
+
+        data::ContainerId targetId;
+        int targetOffset = 0;
+        bool found = false;
+
+        for (int i = deletedIdx - 1; i >= 0; --i) {
+            const auto& candidate = textOrderBefore[i];
+            if (std::find(textOrderAfter.begin(), textOrderAfter.end(), candidate) != textOrderAfter.end()) {
+                targetId = candidate;
+                targetOffset = interaction::textLength(snapshot_, targetId);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (size_t i = deletedIdx + 1; i < textOrderBefore.size(); ++i) {
+                const auto& candidate = textOrderBefore[i];
+                if (std::find(textOrderAfter.begin(), textOrderAfter.end(), candidate) != textOrderAfter.end()) {
+                    targetId = candidate;
+                    targetOffset = 0;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            targetId = textOrderAfter.front();
+            targetOffset = 0;
+        }
+
+        state_ = interaction::makeInitialState(snapshot_, layout_, targetId, targetOffset);
+    } else {
+        state_ = interaction::refreshStateGeometry(state_, layout_);
+    }
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
+}
+
+std::optional<data::ContainerId> EditorSession::addTextContainer(const data::ContainerId& parentId, const QString& initialText)
+{
+    const auto targetParent = parentId.isEmpty() ? snapshot_.root.id : parentId;
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+
+    const auto added = document_.addText(targetParent, initialText);
+    if (!added) {
+        undoStack_.pop_back();
+        emit editRejected(QStringLiteral("无法添加文本容器"));
+        return std::nullopt;
+    }
+
+    setLayoutSnapshot(document_.toSnapshot());
+    containerSelection_.clear();
+
+    const auto savedPending = state_.pendingCharStyle;
+    state_ = interaction::makeInitialState(snapshot_, layout_, *added, 0);
+    state_.pendingCharStyle = savedPending;
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return added;
+}
+
+std::optional<data::ContainerId> EditorSession::addGroupContainer(const data::ContainerId& parentId)
+{
+    const auto targetParent = parentId.isEmpty() ? snapshot_.root.id : parentId;
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+
+    const auto added = document_.addGroup(targetParent);
+    if (!added) {
+        undoStack_.pop_back();
+        emit editRejected(QStringLiteral("无法添加分组容器"));
+        return std::nullopt;
+    }
+
+    setLayoutSnapshot(document_.toSnapshot());
+    containerSelection_.clear();
+    containerSelection_.select(*added, false);
+    state_ = interaction::refreshStateGeometry(state_, layout_);
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return added;
+}
+
+bool EditorSession::undo()
+{
+    if (undoStack_.empty())
+        return false;
+
+    stopLiveDragTimer();
+    liveDragSnapshot_.reset();
+    liveDragLayout_.reset();
+
+    auto prevEntry = std::move(undoStack_.back());
+    undoStack_.pop_back();
+
+    redoStack_.push_back({snapshot_, state_});
+
+    QString error;
+    auto restored = document::Document::fromSnapshot(prevEntry.snapshot, &error);
+    if (!restored) {
+        emit editRejected(error);
+        return false;
+    }
+
+    document_ = std::move(*restored);
+    setLayoutSnapshot(std::move(prevEntry.snapshot));
+    containerSelection_.clear();
+
+    std::vector<data::ContainerId> textNodes;
+    collectTextContainers(snapshot_.root, textNodes);
+    if (textNodes.empty()) {
+        state_ = interaction::InteractionState{};
+    } else {
+        const auto it = std::find(textNodes.begin(), textNodes.end(), prevEntry.state.caret.containerId);
+        if (it != textNodes.end()) {
+            state_ = interaction::refreshStateGeometry(prevEntry.state, layout_);
+        } else {
+            state_ = interaction::makeInitialState(snapshot_, layout_, textNodes.front(), 0);
+        }
+    }
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
+}
+
+bool EditorSession::redo()
+{
+    if (redoStack_.empty())
+        return false;
+
+    stopLiveDragTimer();
+    liveDragSnapshot_.reset();
+    liveDragLayout_.reset();
+
+    auto nextEntry = std::move(redoStack_.back());
+    redoStack_.pop_back();
+
+    undoStack_.push_back({snapshot_, state_});
+
+    QString error;
+    auto restored = document::Document::fromSnapshot(nextEntry.snapshot, &error);
+    if (!restored) {
+        emit editRejected(error);
+        return false;
+    }
+
+    document_ = std::move(*restored);
+    setLayoutSnapshot(std::move(nextEntry.snapshot));
+    containerSelection_.clear();
+
+    std::vector<data::ContainerId> textNodes;
+    collectTextContainers(snapshot_.root, textNodes);
+    if (textNodes.empty()) {
+        state_ = interaction::InteractionState{};
+    } else {
+        const auto it = std::find(textNodes.begin(), textNodes.end(), nextEntry.state.caret.containerId);
+        if (it != textNodes.end()) {
+            state_ = interaction::refreshStateGeometry(nextEntry.state, layout_);
+        } else {
+            state_ = interaction::makeInitialState(snapshot_, layout_, textNodes.front(), 0);
+        }
+    }
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
 }
 
 void EditorSession::setLayoutSnapshot(data::DocumentSnapshot snapshot)
@@ -151,6 +396,307 @@ void EditorSession::setLayoutSnapshot(data::DocumentSnapshot snapshot)
     auto newLayout = layout::composeLayout(snapshot);
     snapshot_ = std::move(snapshot);
     layout_ = std::move(newLayout);
+}
+
+static data::ContainerNode* findNodeMut(data::ContainerNode& root, const data::ContainerId& id)
+{
+    if (root.id == id)
+        return &root;
+    for (auto& child : root.children) {
+        if (auto* found = findNodeMut(child, id))
+            return found;
+    }
+    return nullptr;
+}
+
+static data::ContainerNode* findNodeAndParentInTree(
+    data::ContainerNode& current,
+    const data::ContainerId& id,
+    data::ContainerNode* parent,
+    data::ContainerNode** outParent)
+{
+    if (current.id == id) {
+        if (outParent)
+            *outParent = parent;
+        return &current;
+    }
+    for (auto& child : current.children) {
+        if (auto* found = findNodeAndParentInTree(child, id, &current, outParent)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+bool EditorSession::sameLiveDragKey(const LiveDragKey& a, const LiveDragKey& b)
+{
+    if (a.kind != b.kind || a.id != b.id || a.parentId != b.parentId ||
+        a.index != b.index || a.placement != b.placement)
+        return false;
+    return std::abs(a.position.x() - b.position.x()) < 0.5 &&
+           std::abs(a.position.y() - b.position.y()) < 0.5 &&
+           std::abs(a.width - b.width) < 0.5 &&
+           std::abs(a.displaySize.width() - b.displaySize.width()) < 0.5 &&
+           std::abs(a.displaySize.height() - b.displaySize.height()) < 0.5;
+}
+
+void EditorSession::stopLiveDragTimer()
+{
+    liveDragFlushTimer_.stop();
+    pendingLiveDrag_.reset();
+    lastLiveDragKey_.reset();
+    liveDragElapsed_.invalidate();
+}
+
+void EditorSession::flushPendingLiveDrag()
+{
+    if (!pendingLiveDrag_)
+        return;
+    const auto pending = std::move(*pendingLiveDrag_);
+    pendingLiveDrag_.reset();
+    applyLiveDragImmediate(pending);
+}
+
+void EditorSession::applyLiveDragImmediate(const PendingLiveDrag& pending)
+{
+    auto candidate = snapshot_;
+    switch (pending.key.kind) {
+    case LiveDragKey::Kind::Geometry:
+        if (auto* node = findNodeMut(candidate.root, pending.key.id)) {
+            node->geometry = pending.geometry;
+        } else {
+            return;
+        }
+        break;
+    case LiveDragKey::Kind::Plan:
+        if (!interaction::ContainerDragEngine::applyPlanToCandidateSnapshot(
+                candidate, pending.key.id, pending.plan, pending.geometry)) {
+            return;
+        }
+        break;
+    case LiveDragKey::Kind::ImageResize:
+        if (auto* node = findNodeMut(candidate.root, pending.key.id);
+            node && node->type == data::ContainerType::Image) {
+            node->image.displaySize = pending.key.displaySize;
+            node->geometry = pending.geometry;
+        } else {
+            return;
+        }
+        break;
+    }
+
+    auto candLayout = layout::composeLayout(candidate);
+    liveDragSnapshot_ = std::move(candidate);
+    liveDragLayout_ = std::move(candLayout);
+    lastLiveDragKey_ = pending.key;
+    liveDragElapsed_.restart();
+    state_ = interaction::refreshStateGeometry(state_, *liveDragLayout_);
+    emit changed(true);
+}
+
+void EditorSession::scheduleOrApplyLiveDrag(PendingLiveDrag pending, bool structureChanged)
+{
+    if (liveDragLayout_.has_value() && lastLiveDragKey_.has_value() &&
+        sameLiveDragKey(*lastLiveDragKey_, pending.key)) {
+        pendingLiveDrag_.reset();
+        liveDragFlushTimer_.stop();
+        return;
+    }
+
+    const bool mustRunNow = !liveDragLayout_.has_value() ||
+        structureChanged ||
+        !liveDragElapsed_.isValid() ||
+        liveDragElapsed_.elapsed() >= 16;
+
+    if (mustRunNow) {
+        pendingLiveDrag_.reset();
+        liveDragFlushTimer_.stop();
+        applyLiveDragImmediate(pending);
+    } else {
+        pendingLiveDrag_ = std::move(pending);
+        if (!liveDragFlushTimer_.isActive()) {
+            const int remaining = qMax<int>(1, 16 - static_cast<int>(liveDragElapsed_.elapsed()));
+            liveDragFlushTimer_.start(remaining);
+        }
+    }
+}
+
+void EditorSession::updateLiveDragGeometry(const data::ContainerId& id, const data::ContainerGeometry& geometry)
+{
+    PendingLiveDrag pending;
+    pending.key.kind = LiveDragKey::Kind::Geometry;
+    pending.key.id = id;
+    pending.key.position = geometry.position;
+    pending.key.width = geometry.width;
+    pending.geometry = geometry;
+    scheduleOrApplyLiveDrag(std::move(pending), false);
+}
+
+void EditorSession::updateLiveDragWithPlan(const data::ContainerId& id,
+                                           const interaction::DragDropPlan& plan,
+                                           const data::ContainerGeometry& geometry)
+{
+    PendingLiveDrag pending;
+    pending.key.kind = LiveDragKey::Kind::Plan;
+    pending.key.id = id;
+    pending.key.parentId = plan.targetParentId.isEmpty() ? snapshot_.root.id : plan.targetParentId;
+    pending.key.index = plan.targetIndex;
+    pending.key.placement = plan.placementMode;
+    pending.key.position = plan.localPosition;
+    pending.key.width = geometry.width;
+    if (plan.targetDisplaySize)
+        pending.key.displaySize = *plan.targetDisplaySize;
+    pending.plan = plan;
+    pending.geometry = geometry;
+
+    const bool structureChanged = !lastLiveDragKey_.has_value() ||
+        lastLiveDragKey_->parentId != pending.key.parentId ||
+        lastLiveDragKey_->index != pending.key.index ||
+        lastLiveDragKey_->placement != pending.key.placement;
+
+    scheduleOrApplyLiveDrag(std::move(pending), structureChanged);
+}
+
+void EditorSession::updateLiveDragNode(const data::ContainerId& id,
+                                       const data::ContainerId& targetParentId,
+                                       std::size_t targetIndex,
+                                       const data::ContainerGeometry& geometry)
+{
+    interaction::DragDropPlan plan;
+    plan.targetParentId = targetParentId;
+    plan.targetIndex = targetIndex;
+    plan.localPosition = geometry.position;
+    const auto* parentNode = (targetParentId.isEmpty() || targetParentId == snapshot_.root.id)
+        ? &snapshot_.root
+        : findNodeMut(snapshot_.root, targetParentId);
+    if (parentNode && parentNode->type == data::ContainerType::Text) {
+        plan.placementMode = data::PlacementMode::Floating;
+    } else {
+        plan.placementMode = data::PlacementMode::Flow;
+    }
+    updateLiveDragWithPlan(id, plan, geometry);
+}
+
+void EditorSession::updateLiveImageResize(const data::ContainerId& id,
+                                          const QSizeF& displaySize,
+                                          const data::ContainerGeometry& geometry)
+{
+    PendingLiveDrag pending;
+    pending.key.kind = LiveDragKey::Kind::ImageResize;
+    pending.key.id = id;
+    pending.key.position = geometry.position;
+    pending.key.displaySize = displaySize;
+    pending.geometry = geometry;
+    scheduleOrApplyLiveDrag(std::move(pending), false);
+}
+
+void EditorSession::clearLiveDrag()
+{
+    stopLiveDragTimer();
+    if (liveDragLayout_) {
+        liveDragLayout_.reset();
+        liveDragSnapshot_.reset();
+        state_ = interaction::refreshStateGeometry(state_, layout_);
+        emit changed(true);
+    }
+}
+
+bool EditorSession::commitContainerGeometry(const data::ContainerId& id, const data::ContainerGeometry& geometry)
+{
+    clearLiveDrag();
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+
+    if (!document_.setContainerGeometry(id, geometry)) {
+        undoStack_.pop_back();
+        emit editRejected(QStringLiteral("无法更新容器几何信息"));
+        return false;
+    }
+
+    setLayoutSnapshot(document_.toSnapshot());
+    state_ = interaction::refreshStateGeometry(state_, layout_);
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
+}
+
+bool EditorSession::moveContainer(const data::ContainerId& id,
+                                   const data::ContainerId& targetParentId,
+                                   std::size_t targetIndex,
+                                   const data::ContainerGeometry& geometry)
+{
+    clearLiveDrag();
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+
+    const auto resolvedTargetParentId = targetParentId.isEmpty() ? snapshot_.root.id : targetParentId;
+
+    const auto nodeInfo = document_.queryNode(id);
+    const auto parentInfo = document_.queryNode(resolvedTargetParentId);
+    if (!nodeInfo || !parentInfo) {
+        undoStack_.pop_back();
+        emit editRejected(QStringLiteral("无法找到移动目标节点"));
+        return false;
+    }
+
+    const bool sameParent = nodeInfo->parentId == resolvedTargetParentId;
+    const std::size_t maxAllowedIndex = sameParent
+        ? (parentInfo->childIds.empty() ? 0 : parentInfo->childIds.size() - 1)
+        : parentInfo->childIds.size();
+    const std::size_t clampedIndex = qMin(targetIndex, maxAllowedIndex);
+
+    if (!document_.moveNode(id, resolvedTargetParentId, clampedIndex, geometry.position)) {
+        undoStack_.pop_back();
+        emit editRejected(QStringLiteral("无法移动容器"));
+        return false;
+    }
+
+    document_.setContainerGeometry(id, geometry);
+
+    setLayoutSnapshot(document_.toSnapshot());
+    state_ = interaction::refreshStateGeometry(state_, layout_);
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
+}
+
+bool EditorSession::commitImageResize(const data::ContainerId& id,
+                                      const QSizeF& displaySize,
+                                      const data::ContainerGeometry& geometry)
+{
+    clearLiveDrag();
+    if (!std::isfinite(displaySize.width()) || displaySize.width() <= 0 ||
+        !std::isfinite(displaySize.height()) || displaySize.height() <= 0) {
+        emit editRejected(QStringLiteral("图片显示尺寸无效"));
+        return false;
+    }
+
+    auto updated = snapshot_;
+    auto* node = findNodeMut(updated.root, id);
+    if (!node || node->type != data::ContainerType::Image) {
+        emit editRejected(QStringLiteral("无法找到目标图片容器"));
+        return false;
+    }
+
+    node->image.displaySize = displaySize;
+    node->geometry = geometry;
+    updated.revision = snapshot_.revision + 1;
+
+    QString error;
+    auto restored = document::Document::fromSnapshot(updated, &error);
+    if (!restored) {
+        emit editRejected(error);
+        return false;
+    }
+
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+    document_ = std::move(*restored);
+    setLayoutSnapshot(document_.toSnapshot());
+    state_ = interaction::refreshStateGeometry(state_, layout_);
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
 }
 
 std::optional<data::ContainerId> EditorSession::insertImage(const QString& path, data::PlacementMode placement)
@@ -220,6 +766,8 @@ std::optional<data::ContainerId> EditorSession::insertImage(const QString& path,
         return reject(QStringLiteral("无法插入图片 %1").arg(source.fileName()));
 
     const auto insertedResource = staged->queryNode(*added)->node.image.resourceId;
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
     setLayoutSnapshot(staged->toSnapshot());
     document_ = std::move(*staged);
     importedImages_.insert(resourceKey, insertedResource);
@@ -263,6 +811,13 @@ void EditorSession::select(const interaction::Hit& anchor, const interaction::Hi
 
     const int start = interaction::alignToGrapheme(content->text, anchor.offset);
     const int end = interaction::alignToGrapheme(content->text, focus.offset);
+    const std::optional<int> newAnchor = (start == end) ? std::nullopt : std::optional<int>(start);
+    if (state_.caret.containerId == focus.containerId &&
+        state_.caret.offset == end &&
+        state_.selectionAnchor == newAnchor &&
+        state_.selection.has_value() == (start != end)) {
+        return;
+    }
     //里面直接默认构造了，所以出问题
     auto state = interaction::makeInitialState(snapshot_, layout_, focus.containerId, end);
     //这里直接赋值回原来的就好，目前最小的改动就是这样，之后建议增加interaction::makeInitialState(snapshot_, layout_, containerId, offset, &state_);
@@ -307,6 +862,40 @@ bool EditorSession::endSelection()
 
 bool EditorSession::key(const interaction::KeyInput& key, const QString& clipboardText)
 {
+    const bool control = key.mods.testFlag(Qt::ControlModifier);
+    const bool shift = key.mods.testFlag(Qt::ShiftModifier);
+    const bool alt = key.mods.testFlag(Qt::AltModifier);
+    const bool meta = key.mods.testFlag(Qt::MetaModifier);
+
+    // 快捷键撤销 / 重做
+    if (control && !shift && !alt && !meta && key.key == Qt::Key_Z) {
+        return undo();
+    }
+    if ((control && shift && key.key == Qt::Key_Z) || (control && !shift && !alt && !meta && key.key == Qt::Key_Y)) {
+        return redo();
+    }
+
+    // 方向键（未按 Shift）走 action 统一处理跨容器导航
+    if (!shift && !alt && !meta) {
+        interaction::EditAction act;
+        if (key.key == Qt::Key_Left) {
+            act.kind = interaction::EditActionKind::MoveLeft;
+            return action(act);
+        }
+        if (key.key == Qt::Key_Right) {
+            act.kind = interaction::EditActionKind::MoveRight;
+            return action(act);
+        }
+        if (key.key == Qt::Key_Up) {
+            act.kind = interaction::EditActionKind::MoveUp;
+            return action(act);
+        }
+        if (key.key == Qt::Key_Down) {
+            act.kind = interaction::EditActionKind::MoveDown;
+            return action(act);
+        }
+    }
+
     return accept(interaction::applyKey(state_, key, snapshot_, layout_, clipboardText));
 }
 
@@ -317,6 +906,33 @@ bool EditorSession::ime(const interaction::ImeInput& ime)
 
 bool EditorSession::action(const interaction::EditAction& action)
 {
+    if (!action.extendSelection) {
+        if (action.kind == interaction::EditActionKind::MoveLeft) {
+            if (auto crossState = interaction::tryCrossLeft(state_, snapshot_, layout_)) {
+                state_ = *crossState;
+                emit changed(false);
+                return true;
+            }
+        } else if (action.kind == interaction::EditActionKind::MoveRight) {
+            if (auto crossState = interaction::tryCrossRight(state_, snapshot_, layout_)) {
+                state_ = *crossState;
+                emit changed(false);
+                return true;
+            }
+        } else if (action.kind == interaction::EditActionKind::MoveUp) {
+            if (auto crossState = interaction::tryCrossVertical(state_, snapshot_, layout_, false)) {
+                state_ = *crossState;
+                emit changed(false);
+                return true;
+            }
+        } else if (action.kind == interaction::EditActionKind::MoveDown) {
+            if (auto crossState = interaction::tryCrossVertical(state_, snapshot_, layout_, true)) {
+                state_ = *crossState;
+                emit changed(false);
+                return true;
+            }
+        }
+    }
     return accept(interaction::applyAction(state_, action, snapshot_, layout_));
 }
 
@@ -349,6 +965,8 @@ bool EditorSession::accept(interaction::InteractionOutput output)
         auto snapshot = target.toSnapshot();
         layoutChanged = snapshot.revision != snapshot_.revision;
         if (layoutChanged) {
+            undoStack_.push_back({snapshot_, state_});
+            redoStack_.clear();
             setLayoutSnapshot(std::move(snapshot));
             if (staged)
                 document_ = std::move(*staged);

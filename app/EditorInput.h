@@ -1,5 +1,7 @@
 #pragma once
 
+#include "SnapEngine.h"
+#include "ContainerDragEngine.h"
 #include <QWidget>
 
 class CanvasWidget;
@@ -34,6 +36,36 @@ private:
 
     CanvasWidget& canvas_;
     EditorSession& session_;
+
+    enum class DragMode {
+        None,
+        MoveContainer,
+        MoveImage,
+        ResizeContainer,
+        ResizeImage
+    };
+
+    struct DragState {
+        DragMode mode = DragMode::None;
+        bool dragStarted = false;
+        interaction::ContainerHitType activeHandle = interaction::ContainerHitType::None;
+        data::ContainerId containerId;
+        data::ContainerType containerType = data::ContainerType::Text;
+        data::ContainerId initialParentId;
+        std::size_t initialIndex = 0;
+        QPointF pressPaperPos;
+        QRectF initialRect;
+        QSizeF initialDisplaySize;
+        data::ContainerGeometry initialGeometry;
+        QRectF parentContentRect;
+        data::LayoutResult baseLayout;
+        interaction::DragDropPlan plan;
+        data::ContainerGeometry candidateGeometry;
+        QSizeF candidateDisplaySize;
+    };
+
+    DragState dragState_;
+    data::ContainerId hoveredBorderId_;
 };
 
 } // namespace editor::app
