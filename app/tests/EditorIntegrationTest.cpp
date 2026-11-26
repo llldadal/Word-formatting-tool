@@ -6,6 +6,7 @@
 #include "ZipWriter.h"
 #include "ContainerHitTest.h"
 #include "CrossContainerCursor.h"
+#include "RichClipboard.h"
 #include "SnapEngine.h"
 
 #include <QAction>
@@ -19,14 +20,18 @@
 #include <QFontComboBox>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMouseEvent>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QStatusBar>
+#include <QStyleHints>
+#include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QToolBar>
+#include <QWheelEvent>
 
 #include <algorithm>
 
@@ -272,6 +277,7 @@ void testEditing(MainWindow& window, app::EditorSession& session, QWidget& input
     check(currentText(session).text.isEmpty(), "The Cut menu did not remove the selection");
     action(window, "actionPaste").trigger();
     check(currentText(session).text == QStringLiteral("AB"), "The Paste menu did not restore the text");
+    QApplication::processEvents();
 
     action(window, "actionSelectAll").trigger();
     action(window, "actionBold").trigger();
@@ -1027,6 +1033,188 @@ void testPhase3Interactions(MainWindow& window, app::EditorSession& session, QWi
           "Left handle drag on child text container must expand width leftward while keeping right edge anchored");
 }
 
+void testUiAndClipboardPolish(MainWindow& window, app::EditorSession& session, QWidget& input, const QTemporaryDir& output)
+{
+    auto* canvas = window.findChild<CanvasWidget*>(QStringLiteral("canvas"));
+    auto* scroll = window.findChild<QScrollArea*>(QStringLiteral("scrollArea"));
+    auto* sizeSpin = window.findChild<QDoubleSpinBox*>();
+    check(canvas && scroll && sizeSpin, "Expected canvas, scroll area, and font size spin box");
+
+    // 1. 状态栏仅保留缩放（问题 6）
+    const auto statusLabels = window.statusBar()->findChildren<QLabel*>();
+    bool hasZoomLabel = false;
+    for (const auto* lbl : statusLabels) {
+        check(!lbl->text().startsWith(QStringLiteral("纸张坐标：")) &&
+              !lbl->text().startsWith(QStringLiteral("光标：")) &&
+              !lbl->text().startsWith(QStringLiteral("溢出：")),
+              "Debug status labels must not be in the bottom-right status bar");
+        if (lbl->text().startsWith(QStringLiteral("缩放："))) {
+            hasZoomLabel = true;
+        }
+    }
+    check(hasZoomLabel, "Zoom label must remain in the bottom-right status bar");
+
+    // 2. 选中文字格式回显（问题 1）与富文本复制粘贴（问题 2）
+    check(session.newDocument(), "Failed to reset document for selection format & clipboard test");
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("A"));
+    edit::EditAction boldItalic24;
+    boldItalic24.kind = edit::EditActionKind::SetCharFormat;
+    boldItalic24.charStyle.bold = true;
+    boldItalic24.charStyle.italic = true;
+    boldItalic24.charStyle.fontSizePt = 24.0;
+    session.action(boldItalic24);
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("B"));
+
+    // 折叠光标此时保留着 24pt+粗体+斜体 的待用格式；选中仅 'A' 时应回显 'A' 的实际格式 (12pt, 非粗非斜)
+    sendKey(input, Qt::Key_Home);
+    sendKey(input, Qt::Key_Right, Qt::ShiftModifier);
+    check(qAbs(sizeSpin->value() - 12.0) < 0.01 &&
+          !action(window, "actionBold").isChecked() &&
+          !action(window, "actionItalic").isChecked(),
+          "Selecting plain 'A' must display 12pt and uncheck bold/italic regardless of pendingCharStyle");
+
+    // 选中仅 'B' 时应回显 24pt+粗体+斜体
+    sendKey(input, Qt::Key_Right);
+    sendKey(input, Qt::Key_Left, Qt::ShiftModifier);
+    check(qAbs(sizeSpin->value() - 24.0) < 0.01 &&
+          action(window, "actionBold").isChecked() &&
+          action(window, "actionItalic").isChecked(),
+          "Selecting formatted 'B' must display 24pt and check bold/italic");
+
+    // 全选 'AB' (混合格式) 时字号留空哨兵，粗体/斜体取消高亮
+    action(window, "actionSelectAll").trigger();
+    check(qAbs(sizeSpin->value() - sizeSpin->minimum()) < 0.01 &&
+          !action(window, "actionBold").isChecked() &&
+          !action(window, "actionItalic").isChecked(),
+          "Mixed selection must show blank font size sentinel and uncheck mixed toggles");
+
+    // 复制 'B' 并粘贴到带有其他 pendingCharStyle 的文档开头，验证粘贴文本保留自身格式
+    sendKey(input, Qt::Key_End);
+    sendKey(input, Qt::Key_Left, Qt::ShiftModifier);
+    action(window, "actionCopy").trigger();
+    check(QApplication::clipboard()->text() == QStringLiteral("B") &&
+          QApplication::clipboard()->mimeData()->hasFormat(QString::fromLatin1(edit::kRichTextMimeType)),
+          "Copy must place rich text payload and plain text on clipboard");
+
+    sendKey(input, Qt::Key_Home);
+    edit::EditAction otherPending;
+    otherPending.kind = edit::EditActionKind::SetCharFormat;
+    otherPending.charStyle.underline = true;
+    otherPending.charStyle.fontSizePt = 10.0;
+    session.action(otherPending);
+    action(window, "actionPaste").trigger();
+    check(currentText(session).text == QStringLiteral("BAB"), "Paste must insert copied character at start");
+    const auto pastedStyle = edit::inspectSelectionStyle(session.snapshot(), session.state().caret.containerId, {0, 1});
+    check(pastedStyle.valid && pastedStyle.bold == true && pastedStyle.italic == true &&
+          pastedStyle.underline == false && pastedStyle.fontSizePt && qAbs(*pastedStyle.fontSizePt - 24.0) < 0.01,
+          "Rich text paste must preserve copied character format instead of applying pendingCharStyle");
+
+    // 3. Ctrl + 滚轮缩放（问题 4）
+    const qreal zoomBefore = canvas->zoom();
+    const QPointF wheelPos(120, 120);
+    QWheelEvent zoomInWheel(wheelPos, input.mapToGlobal(wheelPos), QPoint(0, 0), QPoint(0, 120),
+                            Qt::NoButton, Qt::ControlModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(&input, &zoomInWheel);
+    check(canvas->zoom() > zoomBefore + 0.05, "Ctrl + positive wheel must zoom in");
+    QWheelEvent zoomOutWheel(wheelPos, input.mapToGlobal(wheelPos), QPoint(0, 0), QPoint(0, -120),
+                             Qt::NoButton, Qt::ControlModifier, Qt::NoScrollPhase, false);
+    QApplication::sendEvent(scroll->viewport(), &zoomOutWheel);
+    check(qAbs(canvas->zoom() - zoomBefore) < 0.05, "Ctrl + negative wheel on viewport must zoom back out");
+    action(window, "actionZoomActual").trigger();
+
+    // 4. 光标闪烁复用（问题 5）
+    input.setFocus();
+    canvas->resetCaretBlink();
+    check(canvas->isCaretVisible(), "Caret must start visible when blink timer resets");
+    const int flashMs = QGuiApplication::styleHints() ? QGuiApplication::styleHints()->cursorFlashTime() : 1060;
+    if (flashMs > 0) {
+        QElapsedTimer waitTimer;
+        waitTimer.start();
+        const qint64 maxWait = qMax<qint64>(900, flashMs);
+        while (canvas->isCaretVisible() && waitTimer.elapsed() < maxWait) {
+            QApplication::processEvents(QEventLoop::AllEvents, 40);
+        }
+        check(!canvas->isCaretVisible(), "CanvasWidget blink timer must toggle caret off");
+        sendKey(input, Qt::Key_unknown, {}, QStringLiteral("X"));
+        check(canvas->isCaretVisible(), "Typing must immediately wake caret back to visible");
+    }
+
+    // 5. 图片复制、剪切与粘贴（问题 7）
+    check(session.newDocument(), "Failed to reset document for image clipboard test");
+    sendKey(input, Qt::Key_unknown, {}, QStringLiteral("Floating image host paragraph. ").repeated(5));
+    const QString imgPath = output.filePath(QStringLiteral("clip-img.png"));
+    QImage sampleImg(120, 90, QImage::Format_RGB32);
+    sampleImg.fill(Qt::darkGreen);
+    check(sampleImg.save(imgPath), "Failed to save image for clipboard test");
+    const auto imgIdOpt = session.insertImage(imgPath, data::PlacementMode::Floating);
+    check(imgIdOpt.has_value() && session.layout().images.size() == 1, "Failed to insert floating image");
+
+    clickAt(input, canvas->paperToWidget(session.layout().images.front().rect.center()));
+    check(session.containerSelection().isSelected(*imgIdOpt), "Image must be selected before copy");
+    action(window, "actionCopy").trigger();
+    check(QApplication::clipboard()->mimeData()->hasFormat(QString::fromLatin1(edit::kImageMimeType)) &&
+          QApplication::clipboard()->mimeData()->hasImage(),
+          "Copying selected image must set both custom image MIME and QImage");
+
+    action(window, "actionPaste").trigger();
+    check(session.layout().images.size() == 2, "Pasting copied image must insert a second floating image");
+    check(session.snapshot().resources.size() == 1, "Same-document image paste must reuse original image resource");
+
+    action(window, "actionCut").trigger();
+    check(session.layout().images.size() == 1 &&
+          QApplication::clipboard()->mimeData()->hasFormat(QString::fromLatin1(edit::kImageMimeType)),
+          "Cutting selected image must remove it and preserve image clipboard data");
+    action(window, "actionPaste").trigger();
+    check(session.layout().images.size() == 2, "Pasting cut image must restore it back");
+    check(session.undo() && session.layout().images.size() == 1, "Ctrl+Z undo after image paste must remove pasted image");
+
+    // 6. 段落对齐（问题 8）：四种对齐切换与多段不互相覆盖缩进
+    data::DocumentSnapshot alignDoc = session.snapshot();
+    alignDoc.root.children.resize(1);
+    alignDoc.root.children.front().children.clear();
+    auto& tc = alignDoc.root.children.front().text;
+    tc.text = QStringLiteral("First paragraph\nSecond indented paragraph");
+    data::ParagraphInfo pFirst{{0, 15}, data::ParagraphRole::Body, 1, {}, {}};
+    data::ParagraphInfo pSecond{{16, 41}, data::ParagraphRole::Body, 1, {}, {}};
+    pSecond.format.leftIndent = 24.0;
+    tc.paragraphs = {pFirst, pSecond};
+    tc.formatSpans.clear();
+    alignDoc.revision += 1;
+    check(session.loadSnapshot(alignDoc), "Failed to load two-paragraph alignment test snapshot");
+
+    action(window, "actionSelectAll").trigger();
+    action(window, "actionAlignCenter").trigger();
+    check(currentText(session).paragraphs[0].format.alignment == data::ParagraphAlignment::Center &&
+          currentText(session).paragraphs[1].format.alignment == data::ParagraphAlignment::Center &&
+          qAbs(currentText(session).paragraphs[1].format.leftIndent - 24.0) < 0.01 &&
+          action(window, "actionAlignCenter").isChecked(),
+          "AlignCenter across multiple paragraphs must set Center on all and preserve per-paragraph indent");
+
+    sendKey(input, Qt::Key_Home, Qt::ControlModifier); // 第 1 段
+    action(window, "actionAlignRight").trigger();
+    check(currentText(session).paragraphs[0].format.alignment == data::ParagraphAlignment::Right &&
+          currentText(session).paragraphs[1].format.alignment == data::ParagraphAlignment::Center &&
+          action(window, "actionAlignRight").isChecked(),
+          "AlignRight on first paragraph must not affect second paragraph");
+
+    // 全选混合对齐（Right + Center）-> 四个对齐按钮均取消选中
+    action(window, "actionSelectAll").trigger();
+    check(!action(window, "actionAlignLeft").isChecked() &&
+          !action(window, "actionAlignCenter").isChecked() &&
+          !action(window, "actionAlignRight").isChecked() &&
+          !action(window, "actionAlignJustify").isChecked(),
+          "Mixed paragraph alignments must uncheck all alignment toolbar buttons");
+
+    action(window, "actionAlignJustify").trigger();
+    check(currentText(session).paragraphs[0].format.alignment == data::ParagraphAlignment::Justify &&
+          action(window, "actionAlignJustify").isChecked(),
+          "AlignJustify must set Justify alignment and update toolbar");
+    action(window, "actionAlignLeft").trigger();
+    check(currentText(session).paragraphs[0].format.alignment == data::ParagraphAlignment::Left &&
+          action(window, "actionAlignLeft").isChecked(),
+          "AlignLeft must restore Left alignment and update toolbar");
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1054,6 +1242,7 @@ int main(int argc, char** argv)
     testContainerSelectionAndDeletion(window, session, *input);
     testPhase2Interactions(window, session, *input);
     testPhase3Interactions(window, session, *input);
+    testUiAndClipboardPolish(window, session, *input, output);
     check(session.newDocument() &&
           session.exportTo(output.filePath(QStringLiteral("missing/failure.docx"))).status == io::DocxExportStatus::IoError,
           "An invalid export path must return an IO error");

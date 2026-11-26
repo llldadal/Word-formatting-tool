@@ -23,6 +23,7 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void inputMethodEvent(QInputMethodEvent* event) override;
     QVariant inputMethodQuery(Qt::InputMethodQuery query) const override;
@@ -30,6 +31,8 @@ protected:
     void focusOutEvent(QFocusEvent* event) override;
 
 private:
+    void syncCaretBlink();
+    QAction* findRegisteredAction(const QString& objectName) const;
     QRectF toWidget(const QRectF& paperRect) const;
     QRectF caretOnPaper() const;
     QFont preeditFont() const;

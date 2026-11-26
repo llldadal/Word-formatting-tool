@@ -17,6 +17,8 @@ add_library(EditorInteraction STATIC
     SnapEngine.cpp
     ContainerDragEngine.h
     ContainerDragEngine.cpp
+    RichClipboard.h
+    RichClipboard.cpp
     InteractionController.h
     InteractionController.cpp
 )

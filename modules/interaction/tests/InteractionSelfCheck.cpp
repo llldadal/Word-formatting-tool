@@ -8,6 +8,7 @@
 #include "TextBoundary.h"
 #include "ContainerDragEngine.h"
 #include "ContainerHitTest.h"
+#include "RichClipboard.h"
 #include "TestFixtures.h"
 
 #include <QGuiApplication>
@@ -1131,6 +1132,85 @@ static void testContainerDragEngine()
           QStringLiteral("child text container inside Group retains left and right resize handles"));
 }
 
+void testRichClipboardAndInspection()
+{
+    out << "\n=== RichClipboard & Style Inspection ===\n";
+
+    ed::DocumentSnapshot doc;
+    ed::ContainerNode textNode;
+    textNode.id = QStringLiteral("t1");
+    textNode.type = ed::ContainerType::Text;
+    textNode.placement = ed::PlacementMode::Flow;
+    textNode.text.text = QStringLiteral("TitleLine\nHello World");
+    ed::ParagraphInfo p0{{0, 9}, ed::ParagraphRole::Title, 1, {}, {}};
+    p0.format.alignment = ed::ParagraphAlignment::Center;
+    ed::ParagraphInfo p1{{10, 21}, ed::ParagraphRole::Body, 1, {}, {}};
+    p1.format.alignment = ed::ParagraphAlignment::Left;
+    p1.format.leftIndent = 18.0;
+    textNode.text.paragraphs = {p0, p1};
+    ed::TextStyleOverride bigItalic;
+    bigItalic.fontSizePt = 24.0;
+    bigItalic.italic = true;
+    textNode.text.formatSpans = {{{10, 15}, bigItalic}}; // "Hello"
+
+    QImage img(40, 30, QImage::Format_ARGB32);
+    img.fill(Qt::red);
+    doc.resources.insert(QStringLiteral("res-img"), img);
+    ed::ContainerNode imgNode;
+    imgNode.id = QStringLiteral("img1");
+    imgNode.type = ed::ContainerType::Image;
+    imgNode.placement = ed::PlacementMode::Floating;
+    imgNode.geometry.position = QPointF(25, 40);
+    imgNode.image = {QStringLiteral("res-img"), QSizeF(80, 60)};
+    textNode.children.push_back(imgNode);
+    doc.root.children.push_back(textNode);
+
+    const auto uniformTitle = ei::inspectSelectionStyle(doc, QStringLiteral("t1"), {0, 9});
+    check(uniformTitle.valid && uniformTitle.bold == true &&
+          uniformTitle.fontSizePt && std::abs(*uniformTitle.fontSizePt - 19.5) < 0.01 &&
+          uniformTitle.italic == false,
+          QStringLiteral("inspectSelectionStyle resolves Title default bold and 19.5pt"));
+
+    const auto mixedSpan = ei::inspectSelectionStyle(doc, QStringLiteral("t1"), {10, 21});
+    check(mixedSpan.valid && !mixedSpan.fontSizePt.has_value() && !mixedSpan.italic.has_value() &&
+          mixedSpan.bold == false && mixedSpan.fontFamily.has_value(),
+          QStringLiteral("inspectSelectionStyle returns nullopt for mixed fontSizePt/italic while preserving consistent fields"));
+
+    const auto paraUniform = ei::inspectParagraphSelection(doc, QStringLiteral("t1"), {0, 9});
+    check(paraUniform.valid && paraUniform.alignment == ed::ParagraphAlignment::Center &&
+          paraUniform.role == ed::ParagraphRole::Title,
+          QStringLiteral("inspectParagraphSelection resolves single paragraph alignment and role"));
+
+    const auto paraMixed = ei::inspectParagraphSelection(doc, QStringLiteral("t1"), {2, 14});
+    check(paraMixed.valid && !paraMixed.alignment.has_value() && !paraMixed.role.has_value(),
+          QStringLiteral("inspectParagraphSelection marks mixed alignment and role across paragraphs"));
+
+    const auto rich = ei::extractRichTextPayload(doc, QStringLiteral("t1"), {0, 15}); // "TitleLine\nHello"
+    check(rich.has_value() && rich->plainText == QStringLiteral("TitleLine\nHello") &&
+          rich->paragraphs.size() == 2 && rich->paragraphs[0].fullParagraph && !rich->paragraphs[1].fullParagraph,
+          QStringLiteral("extractRichTextPayload captures 1-to-1 paragraph meta and fullParagraph flags"));
+    const auto encoded = ei::encodeRichTextPayload(*rich);
+    const auto decoded = ei::decodeRichTextPayload(encoded);
+    check(decoded.has_value() && decoded->plainText == rich->plainText &&
+          decoded->formatSpans.size() == 2 &&
+          decoded->formatSpans[0].style.bold == true &&
+          decoded->formatSpans[1].style.italic == true &&
+          std::abs(*decoded->formatSpans[1].style.fontSizePt - 24.0) < 0.01 &&
+          decoded->paragraphs[1].format.leftIndent == 18.0,
+          QStringLiteral("rich text payload JSON round-trip preserves spans and paragraph metadata"));
+
+    const auto imgPayload = ei::extractImagePayload(doc, QStringLiteral("img1"));
+    check(imgPayload.has_value() && imgPayload->sourceResourceId == QStringLiteral("res-img") &&
+          imgPayload->placement == ed::PlacementMode::Floating &&
+          imgPayload->displaySize == QSizeF(80, 60),
+          QStringLiteral("extractImagePayload retrieves image metadata and QImage"));
+    const auto imgDecoded = ei::decodeImagePayload(ei::encodeImagePayload(*imgPayload));
+    check(imgDecoded.has_value() && imgDecoded->sourceParentId == QStringLiteral("t1") &&
+          imgDecoded->geometry.position == QPointF(25, 40) &&
+          imgDecoded->image.size() == QSize(40, 30),
+          QStringLiteral("image payload JSON+PNG round-trip succeeds"));
+}
+
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
@@ -1145,6 +1225,7 @@ int main(int argc, char** argv)
     testController();
     testInteractionRegressions();
     testContainerDragEngine();
+    testRichClipboardAndInspection();
 
     out << "\n===== Interaction self-check: ";
     if (failures == 0)

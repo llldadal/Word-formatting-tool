@@ -1,14 +1,16 @@
 #include "CanvasWidget.h"
 
 #include <QFocusEvent>
+#include <QGuiApplication>
 #include <QKeyEvent>
 #include <QFontMetricsF>
 #include <QInputMethodEvent>
-#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QStyleHints>
 #include <QTextLayout>
 #include <QTextLine>
+#include <QWheelEvent>
 #include <cmath>
 
 using namespace editor::data;
@@ -26,9 +28,11 @@ CanvasWidget::CanvasWidget(QWidget* parent)
     m_blinkTimer.setInterval(530);
     connect(&m_blinkTimer, &QTimer::timeout, this, [this]() {
         m_caretVisible = !m_caretVisible;
-        update();
+        emit caretBlinkChanged(m_caretVisible);
+        if (m_interaction) {
+            update();
+        }
     });
-    m_blinkTimer.start();
 }
 
 void CanvasWidget::setDocumentData(const DocumentSnapshot& snapshot, const LayoutResult& result)
@@ -77,6 +81,40 @@ QRectF CanvasWidget::caretRectInWidget() const
 {
     // 暂时返回空，等真实交互模块接入后，换成 m_interaction->caretRectangle()
     return QRectF();
+}
+
+void CanvasWidget::resetCaretBlink()
+{
+    const bool wasVisible = m_caretVisible;
+    m_caretVisible = true;
+    int flashMs = 1060;
+    if (const QStyleHints* hints = QGuiApplication::styleHints()) {
+        flashMs = hints->cursorFlashTime();
+    }
+    if (flashMs > 0) {
+        m_blinkTimer.start(qMax(150, flashMs / 2));
+    } else {
+        m_blinkTimer.stop();
+    }
+    if (!wasVisible) {
+        emit caretBlinkChanged(true);
+    }
+    if (m_interaction) {
+        update();
+    }
+}
+
+void CanvasWidget::setCaretBlinking(bool active)
+{
+    if (active) {
+        resetCaretBlink();
+        return;
+    }
+    m_blinkTimer.stop();
+    if (!m_caretVisible) {
+        m_caretVisible = true;
+        emit caretBlinkChanged(true);
+    }
 }
 
 QRectF CanvasWidget::contentAreaInPaper() const
@@ -370,6 +408,22 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event)
         update();
     }
     QWidget::mouseReleaseEvent(event);
+}
+
+void CanvasWidget::wheelEvent(QWheelEvent* event)
+{
+    if (event->modifiers().testFlag(Qt::ControlModifier)) {
+        int delta = event->angleDelta().y();
+        if (delta == 0) {
+            delta = event->pixelDelta().y();
+        }
+        if (delta != 0) {
+            emit zoomWheelRequested(delta, event->globalPosition());
+            event->accept();
+            return;
+        }
+    }
+    QWidget::wheelEvent(event);
 }
 
 void CanvasWidget::keyPressEvent(QKeyEvent* event)

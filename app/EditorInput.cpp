@@ -19,6 +19,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <cmath>
 
 namespace editor::app {
@@ -130,6 +131,40 @@ EditorInput::EditorInput(CanvasWidget& canvas, EditorSession& session)
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(this);
     canvas.setFocusProxy(this);
+
+    connect(&canvas_, &CanvasWidget::caretBlinkChanged, this, [this](bool) {
+        const auto rect = cursorRectangle();
+        if (rect.isValid()) {
+            update(rect.toAlignedRect().adjusted(-4, -4, 4, 4));
+        } else {
+            update();
+        }
+    });
+    connect(&session_, &EditorSession::changed, this, [this](bool) {
+        if (!session_.isDragging())
+            syncCaretBlink();
+    });
+    connect(&session_, &EditorSession::containerSelectionChanged, this, [this]() {
+        syncCaretBlink();
+    });
+}
+
+void EditorInput::syncCaretBlink()
+{
+    const bool active = hasFocus()
+        && session_.containerSelection().empty()
+        && dragState_.mode == DragMode::None
+        && !session_.state().caret.containerId.isEmpty();
+    canvas_.setCaretBlinking(active);
+}
+
+QAction* EditorInput::findRegisteredAction(const QString& objectName) const
+{
+    for (auto* act : actions()) {
+        if (act && act->objectName() == objectName)
+            return act;
+    }
+    return nullptr;
 }
 
 QRectF EditorInput::toWidget(const QRectF& paperRect) const
@@ -216,7 +251,8 @@ void EditorInput::paintEvent(QPaintEvent*)
     }
 
     // 5. 文字光标（容器被选中时隐藏）
-    if (session_.containerSelection().empty()) {
+    if (session_.containerSelection().empty() &&
+        (canvas_.isCaretVisible() || !state.preedit.text.isEmpty())) {
         const auto caret = caretOnPaper();
         if (caret.isValid()) {
             painter.setPen(QPen(QColor(26, 26, 26), 1 / canvas_.zoom()));
@@ -392,6 +428,7 @@ void EditorInput::mousePressEvent(QMouseEvent* event)
                 event->ignore();
                 return;
             }
+            syncCaretBlink();
             event->accept();
             return;
         }
@@ -424,20 +461,25 @@ void EditorInput::mousePressEvent(QMouseEvent* event)
             update();
         };
         callbacks.onCopy = [this]() {
-            interaction::EditAction act;
-            act.kind = interaction::EditActionKind::Copy;
-            session_.action(act);
+            if (auto* act = findRegisteredAction(QStringLiteral("actionCopy"))) {
+                act->trigger();
+            } else if (auto mime = session_.copySelection()) {
+                QGuiApplication::clipboard()->setMimeData(mime.release());
+            }
         };
         callbacks.onCut = [this]() {
-            interaction::EditAction act;
-            act.kind = interaction::EditActionKind::Cut;
-            session_.action(act);
+            if (auto* act = findRegisteredAction(QStringLiteral("actionCut"))) {
+                act->trigger();
+            } else if (auto mime = session_.cutSelection()) {
+                QGuiApplication::clipboard()->setMimeData(mime.release());
+            }
         };
         callbacks.onPaste = [this]() {
-            interaction::EditAction act;
-            act.kind = interaction::EditActionKind::Paste;
-            act.text = QGuiApplication::clipboard()->text();
-            session_.action(act);
+            if (auto* act = findRegisteredAction(QStringLiteral("actionPaste"))) {
+                act->trigger();
+            } else {
+                session_.pasteFromMimeData(QGuiApplication::clipboard()->mimeData());
+            }
         };
         callbacks.onUndo = [this]() {
             session_.undo();
@@ -575,6 +617,22 @@ void EditorInput::mouseMoveEvent(QMouseEvent* event)
     event->accept();
 }
 
+void EditorInput::wheelEvent(QWheelEvent* event)
+{
+    if (event->modifiers().testFlag(Qt::ControlModifier)) {
+        int delta = event->angleDelta().y();
+        if (delta == 0) {
+            delta = event->pixelDelta().y();
+        }
+        if (delta != 0) {
+            emit canvas_.zoomWheelRequested(delta, event->globalPosition());
+            event->accept();
+            return;
+        }
+    }
+    QWidget::wheelEvent(event);
+}
+
 void EditorInput::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
@@ -598,6 +656,7 @@ void EditorInput::mouseReleaseEvent(QMouseEvent* event)
             } else {
                 session_.clearLiveDrag();
             }
+            syncCaretBlink();
             update();
             event->accept();
             return;
@@ -616,6 +675,7 @@ void EditorInput::keyPressEvent(QKeyEvent* event)
     if (event->key() == Qt::Key_Escape && dragState_.mode != DragMode::None) {
         dragState_ = DragState{};
         session_.clearLiveDrag();
+        syncCaretBlink();
         update();
         event->accept();
         return;
@@ -625,6 +685,25 @@ void EditorInput::keyPressEvent(QKeyEvent* event)
     for (auto* action : actions()) {
         if (action->shortcuts().contains(shortcut)) {
             action->trigger();
+            event->accept();
+            return;
+        }
+    }
+    if (event->matches(QKeySequence::Copy)) {
+        if (auto* act = findRegisteredAction(QStringLiteral("actionCopy"))) {
+            act->trigger();
+            event->accept();
+            return;
+        }
+    } else if (event->matches(QKeySequence::Cut)) {
+        if (auto* act = findRegisteredAction(QStringLiteral("actionCut"))) {
+            act->trigger();
+            event->accept();
+            return;
+        }
+    } else if (event->matches(QKeySequence::Paste)) {
+        if (auto* act = findRegisteredAction(QStringLiteral("actionPaste"))) {
+            act->trigger();
             event->accept();
             return;
         }
@@ -660,6 +739,7 @@ void EditorInput::keyPressEvent(QKeyEvent* event)
     }
 
     session_.key({event->key(), event->modifiers(), event->text()}, {});
+    syncCaretBlink();
     event->accept();
 }
 
@@ -677,6 +757,7 @@ void EditorInput::inputMethodEvent(QInputMethodEvent* event)
         }
     }
     session_.ime(input);
+    syncCaretBlink();
     event->accept();
 }
 
@@ -710,12 +791,14 @@ QVariant EditorInput::inputMethodQuery(Qt::InputMethodQuery query) const
 void EditorInput::focusInEvent(QFocusEvent* event)
 {
     QWidget::focusInEvent(event);
+    syncCaretBlink();
     refreshInputMethod();
     update();
 }
 
 void EditorInput::focusOutEvent(QFocusEvent* event)
 {
+    canvas_.setCaretBlinking(false);
     session_.endSelection();
     if (!session_.state().preedit.text.isEmpty()) {
         interaction::EditAction cancel;

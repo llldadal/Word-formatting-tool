@@ -8,6 +8,7 @@
 #include <QClipboard>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFontComboBox>
@@ -16,6 +17,7 @@
 #include <QInputMethod>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMetaMethod>
@@ -23,9 +25,11 @@
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QStatusBar>
+#include <QThread>
 #include <QToolBar>
 
 #include <algorithm>
+#include <cmath>
 
 namespace editor::app {
 namespace {
@@ -46,6 +50,21 @@ void disconnectPlaceholder(Sender* sender, Signal signal, MainWindow& window, co
     const int index = metaObject.indexOfSlot(slot);
     if (index >= 0)
         QObject::disconnect(sender, QMetaMethod::fromSignal(signal), &window, metaObject.method(index));
+}
+
+std::unique_ptr<QMimeData> cloneMimeData(const QMimeData& src)
+{
+    auto copy = std::make_unique<QMimeData>();
+    for (const QString& fmt : src.formats()) {
+        copy->setData(fmt, src.data(fmt));
+    }
+    if (src.hasText()) {
+        copy->setText(src.text());
+    }
+    if (src.hasImage()) {
+        copy->setImageData(src.imageData());
+    }
+    return copy;
 }
 
 } // namespace
@@ -86,6 +105,10 @@ EditorIntegration::EditorIntegration(MainWindow& window) : QObject(&window), win
     });
     connect(&session_, &EditorSession::clipboardRequested, this, [](const QString& text) {
         QGuiApplication::clipboard()->setText(text);
+    });
+    connect(QGuiApplication::clipboard(), &QClipboard::dataChanged, this, [this]() {
+        if (!writingClipboard_)
+            fallbackClipboard_.reset();
     });
     connect(scroll_->horizontalScrollBar(), &QScrollBar::valueChanged, input_, &EditorInput::refreshInputMethod);
     connect(scroll_->verticalScrollBar(), &QScrollBar::valueChanged, input_, &EditorInput::refreshInputMethod);
@@ -131,11 +154,25 @@ void EditorIntegration::bindActions()
         editMenu->insertAction(selectAll, item);
         input_->addAction(item);
         connect(item, &QAction::triggered, this, [this, kind] {
-            interaction::EditAction request;
-            request.kind = kind;
-            if (kind == interaction::EditActionKind::Paste)
-                request.text = QGuiApplication::clipboard()->text();
-            session_.action(request);
+            if (kind == interaction::EditActionKind::Copy) {
+                writeClipboard(session_.copySelection());
+            } else if (kind == interaction::EditActionKind::Cut) {
+                writeClipboard(session_.cutSelection());
+            } else if (kind == interaction::EditActionKind::Paste) {
+                const QMimeData* sysMime = QGuiApplication::clipboard()->mimeData();
+                const QString richMime = QString::fromLatin1(interaction::kRichTextMimeType);
+                const QString imgMime = QString::fromLatin1(interaction::kImageMimeType);
+                const bool hasSystemPayload = sysMime &&
+                    (sysMime->hasFormat(richMime) || sysMime->hasFormat(imgMime) ||
+                     sysMime->hasImage() || (sysMime->hasText() && !sysMime->text().isEmpty()));
+                if (hasSystemPayload) {
+                    session_.pasteFromMimeData(sysMime);
+                } else if (fallbackClipboard_) {
+                    session_.pasteFromMimeData(fallbackClipboard_.get());
+                } else {
+                    session_.pasteFromMimeData(sysMime);
+                }
+            }
             input_->setFocus();
         });
     };
@@ -160,6 +197,8 @@ void EditorIntegration::bindActions()
         input_->setFocus();
     });
     connect(size_, &QDoubleSpinBox::valueChanged, this, [this](double points) {
+        if (points < 6.0)
+            return;
         data::TextStyleOverride style;
         style.fontSizePt = points;
         setCharStyle(style);
@@ -185,6 +224,22 @@ void EditorIntegration::bindActions()
     bindToggle(bold_, "applyBold(bool)", &data::TextStyleOverride::bold);
     bindToggle(italic_, "applyItalic(bool)", &data::TextStyleOverride::italic);
     bindToggle(underline_, "applyUnderline(bool)", &data::TextStyleOverride::underline);
+
+    alignLeft_ = action(QStringLiteral("actionAlignLeft"));
+    alignCenter_ = action(QStringLiteral("actionAlignCenter"));
+    alignRight_ = action(QStringLiteral("actionAlignRight"));
+    alignJustify_ = action(QStringLiteral("actionAlignJustify"));
+    const auto bindAlign = [&](QAction* act, data::ParagraphAlignment align) {
+        input_->addAction(act);
+        bind(act, &QAction::triggered, "applyAlignment()", [this, align](bool) {
+            session_.setParagraphAlignment(align);
+            input_->setFocus();
+        });
+    };
+    bindAlign(alignLeft_, data::ParagraphAlignment::Left);
+    bindAlign(alignCenter_, data::ParagraphAlignment::Center);
+    bindAlign(alignRight_, data::ParagraphAlignment::Right);
+    bindAlign(alignJustify_, data::ParagraphAlignment::Justify);
 
     auto* formatMenu = requiredChild<QMenu>(window_, QStringLiteral("menuFormat"));
     auto* insertMenu = new QMenu(QStringLiteral("插入(&I)"), &window_);
@@ -220,6 +275,11 @@ void EditorIntegration::bindActions()
     bindZoom(QStringLiteral("actionFitWidth"), [this] {
         setZoom(canvas_->zoomToFitWidth(scroll_->viewport()->width()));
     });
+    disconnectPlaceholder(canvas_, &CanvasWidget::zoomWheelRequested, window_, "onZoomWheel(int,QPointF)");
+    connect(canvas_, &CanvasWidget::zoomWheelRequested, this, [this](int angleDeltaY, const QPointF& globalPos) {
+        const qreal factor = std::pow(1.1, static_cast<qreal>(angleDeltaY) / 120.0);
+        setZoomAt(canvas_->zoom() * factor, globalPos);
+    });
 }
 
 void EditorIntegration::refresh(bool layoutChanged)
@@ -244,34 +304,82 @@ void EditorIntegration::refresh(bool layoutChanged)
 
 void EditorIntegration::refreshToolbar()
 {
-    const auto style = session_.currentStyle();
-    if (font_->currentFont().family() != style.fontFamily) {
+    const auto style = session_.currentSelectionStyle();
+    if (style.fontFamily.has_value()) {
+        const bool needUpdate = (font_->currentIndex() < 0) ||
+            (font_->currentFont().family() != *style.fontFamily) ||
+            (font_->lineEdit() && font_->lineEdit()->text() != *style.fontFamily);
+        if (needUpdate) {
+            const QSignalBlocker fontBlocker(font_);
+            font_->setCurrentFont(QFont(*style.fontFamily));
+            if (font_->lineEdit() && font_->lineEdit()->text().isEmpty()) {
+                font_->setEditText(*style.fontFamily);
+            }
+        }
+    } else if (font_->currentIndex() >= 0 || (font_->lineEdit() && !font_->lineEdit()->text().isEmpty())) {
         const QSignalBlocker fontBlocker(font_);
-        font_->setCurrentFont(QFont(style.fontFamily));
+        font_->setCurrentIndex(-1);
+        if (font_->lineEdit()) {
+            font_->lineEdit()->clear();
+        }
     }
-    if (!qFuzzyCompare(size_->value(), style.fontSizePt)) {
-        const QSignalBlocker sizeBlocker(size_);
-        size_->setValue(style.fontSizePt);
-    }
-    if (bold_->isChecked() != style.bold)
-        bold_->setChecked(style.bold);
-    if (italic_->isChecked() != style.italic)
-        italic_->setChecked(style.italic);
-    if (underline_->isChecked() != style.underline)
-        underline_->setChecked(style.underline);
 
-    int level = 0;
-    if (const auto* paragraph = session_.currentParagraph()) {
-        if (paragraph->role == data::ParagraphRole::Title)
-            level = -1;
-        if (paragraph->role == data::ParagraphRole::Heading)
-            level = paragraph->headingLevel;
+    const qreal targetSize = style.fontSizePt.value_or(size_->minimum());
+    if (!qFuzzyCompare(size_->value(), targetSize)) {
+        const QSignalBlocker sizeBlocker(size_);
+        size_->setValue(targetSize);
     }
-    const int targetIndex = paragraph_->findData(level);
+
+    const bool isBold = style.bold.value_or(false);
+    if (bold_->isChecked() != isBold) {
+        const QSignalBlocker boldBlocker(bold_);
+        bold_->setChecked(isBold);
+    }
+    const bool isItalic = style.italic.value_or(false);
+    if (italic_->isChecked() != isItalic) {
+        const QSignalBlocker italicBlocker(italic_);
+        italic_->setChecked(isItalic);
+    }
+    const bool isUnderline = style.underline.value_or(false);
+    if (underline_->isChecked() != isUnderline) {
+        const QSignalBlocker underlineBlocker(underline_);
+        underline_->setChecked(isUnderline);
+    }
+
+    const auto para = session_.currentParagraphSummary();
+    int targetIndex = -1;
+    if (para.role.has_value() && (*para.role != data::ParagraphRole::Heading || para.headingLevel.has_value())) {
+        int level = 0;
+        if (*para.role == data::ParagraphRole::Title)
+            level = -1;
+        else if (*para.role == data::ParagraphRole::Heading)
+            level = *para.headingLevel;
+        targetIndex = paragraph_->findData(level);
+    }
     if (paragraph_->currentIndex() != targetIndex) {
         const QSignalBlocker paragraphBlocker(paragraph_);
         paragraph_->setCurrentIndex(targetIndex);
     }
+
+    const auto align = para.alignment;
+    const auto syncAlign = [](QAction* act, bool checked) {
+        if (act && act->isChecked() != checked) {
+            const QSignalBlocker blocker(act);
+            act->setChecked(checked);
+        }
+    };
+    const bool wantLeft = align && *align == data::ParagraphAlignment::Left;
+    const bool wantCenter = align && *align == data::ParagraphAlignment::Center;
+    const bool wantRight = align && *align == data::ParagraphAlignment::Right;
+    const bool wantJustify = align && *align == data::ParagraphAlignment::Justify;
+    if (!wantLeft) syncAlign(alignLeft_, false);
+    if (!wantCenter) syncAlign(alignCenter_, false);
+    if (!wantRight) syncAlign(alignRight_, false);
+    if (!wantJustify) syncAlign(alignJustify_, false);
+    if (wantLeft) syncAlign(alignLeft_, true);
+    if (wantCenter) syncAlign(alignCenter_, true);
+    if (wantRight) syncAlign(alignRight_, true);
+    if (wantJustify) syncAlign(alignJustify_, true);
 }
 
 void EditorIntegration::setCharStyle(const data::TextStyleOverride& style)
@@ -298,18 +406,60 @@ void EditorIntegration::setParagraphRole(int level)
 void EditorIntegration::setZoom(qreal zoom)
 {
     auto* viewport = scroll_->viewport();
-    const auto anchor = canvas_->widgetToPaper(canvas_->mapFrom(viewport, QPointF(viewport->rect().center())));
+    setZoomAt(zoom, viewport->mapToGlobal(viewport->rect().center()));
+}
+
+void EditorIntegration::setZoomAt(qreal zoom, const QPointF& globalAnchorPos)
+{
+    auto* viewport = scroll_->viewport();
+    const QPointF localPos = viewport->mapFromGlobal(globalAnchorPos);
+    const QPointF anchorViewport = viewport->rect().contains(localPos.toPoint())
+        ? localPos
+        : QPointF(viewport->rect().center());
+    const auto anchor = canvas_->widgetToPaper(canvas_->mapFrom(viewport, anchorViewport));
     canvas_->setZoom(zoom);
-    const auto target = canvas_->mapTo(viewport, canvas_->paperToWidget(anchor)).toPoint();
-    const auto offset = target - viewport->rect().center();
+    const auto target = canvas_->mapTo(viewport, canvas_->paperToWidget(anchor));
+    const auto offset = target - anchorViewport;
     auto* horizontal = scroll_->horizontalScrollBar();
     auto* vertical = scroll_->verticalScrollBar();
-    horizontal->setValue(horizontal->value() + offset.x());
-    vertical->setValue(vertical->value() + offset.y());
+    horizontal->setValue(horizontal->value() + qRound(offset.x()));
+    vertical->setValue(vertical->value() + qRound(offset.y()));
     if (zoom_)
         zoom_->setText(QStringLiteral("缩放：%1%").arg(qRound(canvas_->zoom() * 100)));
     input_->update();
     input_->refreshInputMethod();
+}
+
+void EditorIntegration::writeClipboard(std::unique_ptr<QMimeData> mime)
+{
+    if (!mime)
+        return;
+
+    auto backup = cloneMimeData(*mime);
+    auto* clipboard = QGuiApplication::clipboard();
+    const QString richMime = QString::fromLatin1(interaction::kRichTextMimeType);
+    const QString imgMime = QString::fromLatin1(interaction::kImageMimeType);
+
+    writingClipboard_ = true;
+    bool ok = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        auto chunk = (attempt == 0) ? std::move(mime) : cloneMimeData(*backup);
+        clipboard->setMimeData(chunk.release());
+        const QMimeData* current = clipboard->mimeData();
+        ok = clipboard->ownsClipboard() ||
+             (current && (current->hasFormat(richMime) || current->hasFormat(imgMime)));
+        if (ok)
+            break;
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 30);
+        QThread::msleep(15);
+    }
+    writingClipboard_ = false;
+
+    if (ok) {
+        fallbackClipboard_.reset();
+    } else {
+        fallbackClipboard_ = std::move(backup);
+    }
 }
 
 void EditorIntegration::insertImage(data::PlacementMode placement)

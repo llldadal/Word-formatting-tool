@@ -10,6 +10,7 @@
 #include <QFileInfo>
 #include <QImageReader>
 #include <QSaveFile>
+#include <QUuid>
 #include <algorithm>
 #include <cmath>
 #include <utility>
@@ -104,6 +105,49 @@ QSize imageSize(const QString& path)
     if (reader.transformation().testFlag(QImageIOHandler::TransformationRotate90))
         size.transpose();
     return size;
+}
+
+const data::ContainerNode* findNodeConst(const data::ContainerNode& root, const data::ContainerId& id)
+{
+    if (root.id == id)
+        return &root;
+    for (const auto& child : root.children) {
+        if (const auto* found = findNodeConst(child, id))
+            return found;
+    }
+    return nullptr;
+}
+
+data::ContainerId findParentIdConst(const data::ContainerNode& root, const data::ContainerId& id)
+{
+    for (const auto& child : root.children) {
+        if (child.id == id)
+            return root.id;
+        const auto nested = findParentIdConst(child, id);
+        if (!nested.isEmpty())
+            return nested;
+    }
+    return {};
+}
+
+bool isTopLevelTextNode(const data::DocumentSnapshot& snapshot, const data::ContainerId& id)
+{
+    for (const auto& child : snapshot.root.children) {
+        if (child.id == id)
+            return child.type == data::ContainerType::Text;
+    }
+    return false;
+}
+
+data::ContainerNode* findNodeTreeMut(data::ContainerNode& root, const data::ContainerId& id)
+{
+    if (root.id == id)
+        return &root;
+    for (auto& child : root.children) {
+        if (auto* found = findNodeTreeMut(child, id))
+            return found;
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -784,21 +828,468 @@ const data::ParagraphInfo* EditorSession::currentParagraph() const
 
 data::TextStyle EditorSession::currentStyle() const
 {
-    const auto* text = interaction::findTextContent(snapshot_, state_.caret.containerId);
+    const bool hasSelection = state_.selection && state_.selection->range.start < state_.selection->range.end;
+    const auto& containerId = hasSelection ? state_.selection->containerId : state_.caret.containerId;
+    const auto* text = interaction::findTextContent(snapshot_, containerId);
     if (!text)
         return {};
-    const int offset = state_.selection ? state_.selection->range.start : state_.caret.offset;
+    const int offset = hasSelection ? state_.selection->range.start : state_.caret.offset;
     auto style = text->defaultStyle;
-    if (const auto* paragraph = paragraphAt(*text, offset))
+    const auto* paragraph = paragraphAt(*text, offset);
+    if (paragraph)
         style = layout::resolveParagraphStyle(style, *paragraph);
-    const int character = offset == text->text.size() ? offset - 1 : offset;
+
+    int character = offset;
+    if (!hasSelection && paragraph && offset == paragraph->range.end && offset > paragraph->range.start) {
+        character = paragraph->range.end - 1;
+    } else if (offset == text->text.size() && offset > 0) {
+        character = offset - 1;
+    }
+
     const auto span = std::lower_bound(text->formatSpans.begin(), text->formatSpans.end(), character,
         [](const data::TextFormatSpan& entry, int position) { return entry.range.end <= position; });
     if (span != text->formatSpans.end() && span->range.start <= character)
         mergeStyle(style, span->style);
-    if (state_.pendingCharStyle)
+
+    // 仅折叠光标时沿用待用格式；有实际选区时反映选中文字的真实格式
+    if (!hasSelection && state_.pendingCharStyle)
         mergeStyle(style, *state_.pendingCharStyle);
     return style;
+}
+
+interaction::SelectionStyleSummary EditorSession::currentSelectionStyle() const
+{
+    if (state_.selection && state_.selection->range.start < state_.selection->range.end) {
+        return interaction::inspectSelectionStyle(snapshot_, state_.selection->containerId, state_.selection->range);
+    }
+
+    auto summary = interaction::inspectSelectionStyle(
+        snapshot_, state_.caret.containerId, {state_.caret.offset, state_.caret.offset});
+    if (!summary.valid)
+        return summary;
+
+    if (state_.pendingCharStyle) {
+        const auto& p = *state_.pendingCharStyle;
+        if (p.fontFamily) summary.fontFamily = *p.fontFamily;
+        if (p.fontSizePt) summary.fontSizePt = *p.fontSizePt;
+        if (p.color) summary.color = *p.color;
+        if (p.bold) summary.bold = *p.bold;
+        if (p.italic) summary.italic = *p.italic;
+        if (p.underline) summary.underline = *p.underline;
+    }
+    return summary;
+}
+
+interaction::ParagraphSelectionSummary EditorSession::currentParagraphSummary() const
+{
+    const bool hasSelection = state_.selection && state_.selection->range.start < state_.selection->range.end;
+    const auto& containerId = hasSelection ? state_.selection->containerId : state_.caret.containerId;
+    const data::TextRange focus = hasSelection
+        ? state_.selection->range
+        : data::TextRange{state_.caret.offset, state_.caret.offset};
+    return interaction::inspectParagraphSelection(snapshot_, containerId, focus);
+}
+
+bool EditorSession::setParagraphAlignment(data::ParagraphAlignment alignment)
+{
+    const bool hasSelection = state_.selection && state_.selection->range.start < state_.selection->range.end;
+    const auto& id = hasSelection ? state_.selection->containerId : state_.caret.containerId;
+    const auto* text = interaction::findTextContent(snapshot_, id);
+    if (!text)
+        return false;
+
+    const data::TextRange focus = hasSelection
+        ? state_.selection->range
+        : data::TextRange{state_.caret.offset, state_.caret.offset};
+    const auto ranges = interaction::paragraphRangesFor(snapshot_, id, focus);
+    if (ranges.empty())
+        return false;
+
+    QString error;
+    auto staged = document::Document::fromSnapshot(snapshot_, &error);
+    if (!staged) {
+        emit editRejected(error);
+        return false;
+    }
+
+    for (const auto& range : ranges) {
+        const auto* para = paragraphAt(*text, range.start);
+        if (!para)
+            continue;
+        auto fmt = para->format;
+        fmt.alignment = alignment;
+        if (!staged->setParagraphFormat(id, range.start, fmt, para->defaultStyle)) {
+            emit editRejected(QStringLiteral("无法设置段落对齐方式"));
+            return false;
+        }
+    }
+
+    auto nextSnapshot = staged->toSnapshot();
+    if (nextSnapshot.revision != snapshot_.revision) {
+        undoStack_.push_back({snapshot_, state_});
+        redoStack_.clear();
+        document_ = std::move(*staged);
+        setLayoutSnapshot(std::move(nextSnapshot));
+        state_ = interaction::refreshStateGeometry(state_, layout_);
+        emit changed(true);
+    }
+    return true;
+}
+
+std::unique_ptr<QMimeData> EditorSession::copySelection() const
+{
+    if (!containerSelection_.empty()) {
+        for (const auto& id : containerSelection_.selectedIds) {
+            const auto* node = findNodeConst(snapshot_.root, id);
+            if (node && node->type == data::ContainerType::Image) {
+                if (const auto payload = interaction::extractImagePayload(snapshot_, id)) {
+                    return interaction::buildImageMimeData(*payload);
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    if (state_.selection && state_.selection->range.start < state_.selection->range.end) {
+        if (const auto payload = interaction::extractRichTextPayload(
+                snapshot_, state_.selection->containerId, state_.selection->range)) {
+            return interaction::buildRichTextMimeData(*payload);
+        }
+    }
+    return nullptr;
+}
+
+std::unique_ptr<QMimeData> EditorSession::cutSelection()
+{
+    if (!containerSelection_.empty()) {
+        for (const auto& id : containerSelection_.selectedIds) {
+            const auto* node = findNodeConst(snapshot_.root, id);
+            if (node && node->type == data::ContainerType::Image) {
+                const auto payload = interaction::extractImagePayload(snapshot_, id);
+                if (payload && removeSelectedContainers()) {
+                    return interaction::buildImageMimeData(*payload);
+                }
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+
+    if (state_.selection && state_.selection->range.start < state_.selection->range.end) {
+        const auto id = state_.selection->containerId;
+        const auto range = state_.selection->range;
+        const auto payload = interaction::extractRichTextPayload(snapshot_, id, range);
+        if (!payload)
+            return nullptr;
+
+        undoStack_.push_back({snapshot_, state_});
+        redoStack_.clear();
+        if (!document_.replaceText(id, range, {})) {
+            undoStack_.pop_back();
+            emit editRejected(QStringLiteral("无法剪切选中文字"));
+            return nullptr;
+        }
+
+        setLayoutSnapshot(document_.toSnapshot());
+        state_.caret.containerId = id;
+        state_.caret.offset = range.start;
+        state_.selection.reset();
+        state_.selectionAnchor.reset();
+        state_.preedit = interaction::PreeditState{};
+        state_.desiredCaretX.reset();
+        state_ = interaction::refreshStateGeometry(state_, layout_);
+        emit changed(true);
+        return interaction::buildRichTextMimeData(*payload);
+    }
+    return nullptr;
+}
+
+bool EditorSession::pasteFromMimeData(const QMimeData* mimeData)
+{
+    if (!mimeData)
+        return false;
+
+    const QString imageMime = QString::fromLatin1(interaction::kImageMimeType);
+    if (mimeData->hasFormat(imageMime)) {
+        const QImage fallback = mimeData->hasImage() ? qvariant_cast<QImage>(mimeData->imageData()) : QImage();
+        if (const auto payload = interaction::decodeImagePayload(mimeData->data(imageMime), fallback)) {
+            return pasteImage(*payload);
+        }
+    }
+
+    const QString richTextMime = QString::fromLatin1(interaction::kRichTextMimeType);
+    if (mimeData->hasFormat(richTextMime)) {
+        if (const auto payload = interaction::decodeRichTextPayload(mimeData->data(richTextMime))) {
+            return pasteRichText(*payload);
+        }
+    }
+
+    if (mimeData->hasImage()) {
+        const QImage img = qvariant_cast<QImage>(mimeData->imageData());
+        if (!img.isNull()) {
+            interaction::ImageClipboardPayload payload;
+            payload.image = img;
+            payload.placement = data::PlacementMode::Floating;
+            return pasteImage(payload);
+        }
+    }
+
+    if (mimeData->hasText()) {
+        interaction::EditAction act;
+        act.kind = interaction::EditActionKind::Paste;
+        act.text = mimeData->text();
+        return action(act);
+    }
+    return false;
+}
+
+bool EditorSession::pasteRichText(const interaction::RichTextClipboardPayload& payload)
+{
+    if (payload.plainText.isEmpty())
+        return false;
+
+    const bool hasSelection = state_.selection && state_.selection->range.start < state_.selection->range.end;
+    const auto activeId = hasSelection ? state_.selection->containerId : state_.caret.containerId;
+    const auto* content = interaction::findTextContent(snapshot_, activeId);
+    if (!content)
+        return false;
+
+    const int len = static_cast<int>(content->text.size());
+    const int rStart = hasSelection ? qBound(0, state_.selection->range.start, len) : qBound(0, state_.caret.offset, len);
+    const int rEnd = hasSelection ? qBound(rStart, state_.selection->range.end, len) : rStart;
+
+    const auto* startPara = paragraphAt(*content, rStart);
+    const auto* endPara = paragraphAt(*content, rEnd);
+    const bool startParaEmpty = startPara && (startPara->range.start == startPara->range.end);
+    const int startParaBegin = startPara ? startPara->range.start : rStart;
+    const int endParaEnd = endPara ? endPara->range.end : rEnd;
+    const bool replacedWholeSinglePara =
+        startPara && endPara && (startPara == endPara) && (rStart == startPara->range.start) && (rEnd == startPara->range.end);
+
+    QString error;
+    auto staged = document::Document::fromSnapshot(snapshot_, &error);
+    if (!staged) {
+        emit editRejected(error);
+        return false;
+    }
+
+    if (!staged->replaceText(activeId, {rStart, rEnd}, payload.plainText, payload.formatSpans)) {
+        emit editRejected(QStringLiteral("无法粘贴富文本内容"));
+        return false;
+    }
+
+    std::vector<int> segOffsets;
+    segOffsets.push_back(rStart);
+    for (int idx = 0; idx < payload.plainText.size(); ++idx) {
+        if (payload.plainText.at(idx) == QLatin1Char('\n')) {
+            segOffsets.push_back(rStart + idx + 1);
+        }
+    }
+
+    if (payload.paragraphs.size() == segOffsets.size()) {
+        const std::size_t segCount = segOffsets.size();
+        for (std::size_t i = 0; i < segCount; ++i) {
+            const auto& meta = payload.paragraphs[i];
+            bool applyMeta = false;
+            if (segCount == 1) {
+                applyMeta = meta.fullParagraph && (startParaEmpty || replacedWholeSinglePara);
+            } else if (i == 0) {
+                applyMeta = meta.fullParagraph && (rStart == startParaBegin);
+            } else if (i + 1 == segCount) {
+                applyMeta = meta.fullParagraph && (rEnd == endParaEnd);
+            } else {
+                applyMeta = true;
+            }
+            if (applyMeta) {
+                staged->setParagraphFormat(activeId, segOffsets[i], meta.format, meta.defaultStyle);
+                staged->setParagraphRole(activeId, segOffsets[i], meta.role, meta.headingLevel);
+            }
+        }
+    }
+
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+    document_ = std::move(*staged);
+    setLayoutSnapshot(document_.toSnapshot());
+
+    containerSelection_.clear();
+    state_.caret.containerId = activeId;
+    state_.caret.offset = rStart + static_cast<int>(payload.plainText.size());
+    state_.selection.reset();
+    state_.selectionAnchor.reset();
+    state_.preedit = interaction::PreeditState{};
+    state_.desiredCaretX.reset();
+    state_ = interaction::refreshStateGeometry(state_, layout_);
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
+}
+
+bool EditorSession::pasteImage(const interaction::ImageClipboardPayload& payload)
+{
+    if (payload.image.isNull()) {
+        emit editRejected(QStringLiteral("剪贴板图片无效"));
+        return false;
+    }
+
+    data::ContainerId candidateTextParentId;
+    if (!containerSelection_.empty()) {
+        for (const auto& sid : containerSelection_.selectedIds) {
+            if (isTopLevelTextNode(snapshot_, sid)) {
+                candidateTextParentId = sid;
+                break;
+            }
+            const auto* sNode = findNodeConst(snapshot_.root, sid);
+            if (sNode && sNode->type == data::ContainerType::Image) {
+                const auto pId = findParentIdConst(snapshot_.root, sid);
+                if (isTopLevelTextNode(snapshot_, pId)) {
+                    candidateTextParentId = pId;
+                    break;
+                }
+            }
+        }
+    }
+    if (candidateTextParentId.isEmpty() && isTopLevelTextNode(snapshot_, state_.caret.containerId)) {
+        candidateTextParentId = state_.caret.containerId;
+    }
+    if (candidateTextParentId.isEmpty() && isTopLevelTextNode(snapshot_, payload.sourceParentId)) {
+        candidateTextParentId = payload.sourceParentId;
+    }
+
+    const bool wantFloating = (payload.placement == data::PlacementMode::Floating);
+    const bool useFloating = wantFloating && !candidateTextParentId.isEmpty();
+    const data::ContainerId targetParentId = useFloating ? candidateTextParentId : snapshot_.root.id;
+    const data::PlacementMode targetPlacement = useFloating ? data::PlacementMode::Floating : data::PlacementMode::Flow;
+
+    QRectF area = layout_.contentRect;
+    if (useFloating) {
+        const auto box = std::find_if(layout_.containers.begin(), layout_.containers.end(),
+            [&targetParentId](const auto& item) { return item.containerId == targetParentId; });
+        if (box != layout_.containers.end() && box->contentRect.isValid()) {
+            area = box->contentRect;
+        }
+    }
+
+    data::ContainerGeometry geometry;
+    const bool isInternal = !payload.sourceResourceId.isEmpty();
+    if (isInternal) {
+        geometry = payload.geometry;
+    } else {
+        geometry.margin = useFloating ? QMarginsF(8, 6, 8, 6) : QMarginsF(0, 8, 0, 8);
+    }
+
+    const qreal padH = geometry.padding.left() + geometry.padding.right();
+    const qreal availW = qMax<qreal>(24.0, area.width() - geometry.margin.left() - geometry.margin.right() - padH);
+    QSizeF displaySize;
+    if (isInternal && payload.displaySize.width() > 0 && payload.displaySize.height() > 0) {
+        displaySize = payload.displaySize;
+        if (displaySize.width() > availW) {
+            const qreal ratio = availW / displaySize.width();
+            displaySize = QSizeF(availW, qMax<qreal>(1.0, displaySize.height() * ratio));
+        }
+    } else {
+        const QSize orig = payload.image.size();
+        const qreal maxW = qMax<qreal>(24.0, area.width() * (useFloating ? 0.4 : 1.0) - geometry.margin.left() - geometry.margin.right() - padH);
+        const qreal maxH = qMax<qreal>(24.0, layout_.contentRect.height() * (useFloating ? 0.4 : 1.0) - geometry.margin.top() - geometry.margin.bottom());
+        const qreal scale = std::min({qreal(1), maxW / orig.width(), maxH / orig.height()});
+        displaySize = QSizeF(orig) * scale;
+    }
+
+    if (useFloating) {
+        const qreal maxX = qMax<qreal>(0, area.width() - (displaySize.width() + padH));
+        QPointF pos;
+        if (isInternal && targetParentId == payload.sourceParentId) {
+            const bool sourceStillPresent = findNodeConst(snapshot_.root, payload.sourceContainerId) != nullptr;
+            pos = sourceStillPresent
+                ? (payload.geometry.position + QPointF(16.0, 16.0))
+                : payload.geometry.position;
+        } else {
+            const qreal x = qMax<qreal>(0, area.width() - geometry.margin.right() - displaySize.width() - padH);
+            const qreal y = qMax<qreal>(geometry.margin.top(),
+                state_.caret.rect.isValid() ? state_.caret.rect.top() - area.top() : 0.0);
+            pos = QPointF(x, y);
+        }
+        geometry.position = QPointF(qBound<qreal>(0, pos.x(), maxX), qMax<qreal>(0, pos.y()));
+    } else {
+        geometry.position = QPointF(0, 0);
+    }
+
+    QString error;
+    std::optional<document::Document> staged;
+    data::ContainerId newImageId;
+
+    const bool canReuseResource = isInternal && snapshot_.resources.contains(payload.sourceResourceId);
+    if (canReuseResource) {
+        staged = document::Document::fromSnapshot(snapshot_, &error);
+        if (!staged) {
+            emit editRejected(error);
+            return false;
+        }
+        const auto added = staged->addImage(targetParentId, payload.sourceResourceId, displaySize);
+        if (!added || !staged->setContainerGeometry(*added, geometry)) {
+            emit editRejected(QStringLiteral("无法粘贴图片"));
+            return false;
+        }
+        newImageId = *added;
+    } else {
+        data::DocumentSnapshot updated = snapshot_;
+        data::ResourceId newResId;
+        do {
+            newResId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        } while (updated.resources.contains(newResId));
+        updated.resources.insert(newResId, payload.image.copy());
+
+        do {
+            newImageId = QStringLiteral("img-") + QUuid::createUuid().toString(QUuid::WithoutBraces).left(12);
+        } while (findNodeConst(updated.root, newImageId) != nullptr);
+
+        data::ContainerNode node;
+        node.id = newImageId;
+        node.type = data::ContainerType::Image;
+        node.placement = targetPlacement;
+        node.geometry = geometry;
+        node.image = {newResId, displaySize};
+
+        auto* targetParent = findNodeTreeMut(updated.root, targetParentId);
+        if (!targetParent) {
+            emit editRejected(QStringLiteral("找不到图片粘贴目标容器"));
+            return false;
+        }
+        targetParent->children.push_back(std::move(node));
+        updated.revision = snapshot_.revision + 1;
+
+        staged = document::Document::fromSnapshot(updated, &error);
+        if (!staged) {
+            emit editRejected(error);
+            return false;
+        }
+    }
+
+    undoStack_.push_back({snapshot_, state_});
+    redoStack_.clear();
+    document_ = std::move(*staged);
+    setLayoutSnapshot(document_.toSnapshot());
+
+    containerSelection_.select(newImageId, false);
+    state_.selection.reset();
+    state_.selectionAnchor.reset();
+    state_.preedit = interaction::PreeditState{};
+    if (!state_.caret.containerId.isEmpty() && findNodeConst(snapshot_.root, state_.caret.containerId)) {
+        state_ = interaction::refreshStateGeometry(state_, layout_);
+    } else {
+        std::vector<data::ContainerId> textNodes;
+        collectTextContainers(snapshot_.root, textNodes);
+        if (textNodes.empty()) {
+            state_ = interaction::InteractionState{};
+        } else {
+            state_ = interaction::makeInitialState(snapshot_, layout_, textNodes.front(), 0);
+        }
+    }
+
+    emit containerSelectionChanged();
+    emit changed(true);
+    return true;
 }
 
 void EditorSession::select(const interaction::Hit& anchor, const interaction::Hit& focus)

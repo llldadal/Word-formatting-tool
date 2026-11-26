@@ -6,11 +6,14 @@
 #include "LayoutResult.h"
 #include "ContainerInteractionTypes.h"
 #include "ContainerDragEngine.h"
+#include "RichClipboard.h"
 
 #include <QElapsedTimer>
 #include <QHash>
+#include <QMimeData>
 #include <QObject>
 #include <QTimer>
+#include <memory>
 #include <vector>
 
 namespace editor::app {
@@ -32,6 +35,15 @@ public:
     const interaction::InteractionState& state() const { return state_; }
     data::TextStyle currentStyle() const;
     const data::ParagraphInfo* currentParagraph() const;
+    interaction::SelectionStyleSummary currentSelectionStyle() const;
+    interaction::ParagraphSelectionSummary currentParagraphSummary() const;
+    bool setParagraphAlignment(data::ParagraphAlignment alignment);
+
+    std::unique_ptr<QMimeData> copySelection() const;
+    std::unique_ptr<QMimeData> cutSelection();
+    bool pasteFromMimeData(const QMimeData* mimeData);
+    bool pasteRichText(const interaction::RichTextClipboardPayload& payload);
+    bool pasteImage(const interaction::ImageClipboardPayload& payload);
 
     // 实时排版与几何提交 (v0.2 阶段三)
     bool isDragging() const { return liveDragLayout_.has_value(); }
