@@ -2,8 +2,10 @@
 #include "ui_MainWindow.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QEvent>
 #include <QFontComboBox>
 #include <QLabel>
 #include <QScrollArea>
@@ -12,7 +14,9 @@
 #include <QStringList>
 #include <QTimer>
 #include <QToolBar>
+#include <QWheelEvent>
 #include <QWidget>
+#include <cmath>
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -21,16 +25,8 @@ MainWindow::MainWindow(QWidget* parent)
     ui->setupUi(this);
     buildToolBar();
 
-    m_pointerLabel = new QLabel(QStringLiteral("纸张坐标：-"), this);
-    m_caretLabel = new QLabel(QStringLiteral("光标：未定位"), this);
-    m_overflowLabel = new QLabel(QStringLiteral("溢出：无"), this);
     m_zoomLabel = new QLabel(QStringLiteral("缩放：100%"), this);
-    m_resultLabel = new QLabel(QStringLiteral("就绪"), this);
-    statusBar()->addPermanentWidget(m_pointerLabel);
-    statusBar()->addPermanentWidget(m_caretLabel);
-    statusBar()->addPermanentWidget(m_overflowLabel);
     statusBar()->addPermanentWidget(m_zoomLabel);
-    statusBar()->addPermanentWidget(m_resultLabel);
 
     connect(ui->actionNew, &QAction::triggered, this, &MainWindow::newDocument);
     connect(ui->actionExportWord, &QAction::triggered, this, &MainWindow::exportWord);
@@ -38,6 +34,10 @@ MainWindow::MainWindow(QWidget* parent)
     connect(ui->actionBold, &QAction::triggered, this, &MainWindow::applyBold);
     connect(ui->actionItalic, &QAction::triggered, this, &MainWindow::applyItalic);
     connect(ui->actionUnderline, &QAction::triggered, this, &MainWindow::applyUnderline);
+    connect(ui->actionAlignLeft, &QAction::triggered, this, &MainWindow::applyAlignment);
+    connect(ui->actionAlignCenter, &QAction::triggered, this, &MainWindow::applyAlignment);
+    connect(ui->actionAlignRight, &QAction::triggered, this, &MainWindow::applyAlignment);
+    connect(ui->actionAlignJustify, &QAction::triggered, this, &MainWindow::applyAlignment);
     connect(ui->actionZoomIn, &QAction::triggered, this, [this]() { setZoom(ui->canvas->zoom() * 1.1); });
     connect(ui->actionZoomOut, &QAction::triggered, this, [this]() { setZoom(ui->canvas->zoom() / 1.1); });
     connect(ui->actionZoomActual, &QAction::triggered, this, [this]() { setZoom(1.0); });
@@ -50,6 +50,8 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_fontCombo, &QFontComboBox::currentFontChanged, this, &MainWindow::applyFontFamily);
     connect(m_styleCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::applyParagraphStyle);
     connect(ui->canvas, &CanvasWidget::pointerMoved, this, &MainWindow::onPointerMoved);
+    connect(ui->canvas, &CanvasWidget::zoomWheelRequested, this, &MainWindow::onZoomWheel);
+    ui->scrollArea->viewport()->installEventFilter(this);
 
     //留空壳，防止程序崩溃，等待主程序注入真实数据
     m_snapshot.page.size = QSizeF(760, 1000);
@@ -84,12 +86,21 @@ void MainWindow::buildToolBar()
     m_fontCombo = new QFontComboBox(ui->mainToolBar);
     m_fontCombo->setMinimumWidth(140);
     m_sizeSpin = new QDoubleSpinBox(ui->mainToolBar);
-    m_sizeSpin->setRange(6.0, 96.0);
+    // 5.0 保留给多选区混合字号时的空值哨兵，实际字号范围为 6.0~96.0 pt
+    m_sizeSpin->setRange(5.0, 96.0);
+    m_sizeSpin->setSpecialValueText(QStringLiteral(" "));
     m_sizeSpin->setValue(12.0);
     m_sizeSpin->setSuffix(QStringLiteral(" pt"));
     m_sizeSpin->setMaximumWidth(100);
     m_styleCombo = new QComboBox(ui->mainToolBar);
     m_styleCombo->addItems({QStringLiteral("正文"), QStringLiteral("标题"), QStringLiteral("标题 1")});
+
+    m_alignGroup = new QActionGroup(this);
+    m_alignGroup->setExclusionPolicy(QActionGroup::ExclusionPolicy::ExclusiveOptional);
+    m_alignGroup->addAction(ui->actionAlignLeft);
+    m_alignGroup->addAction(ui->actionAlignCenter);
+    m_alignGroup->addAction(ui->actionAlignRight);
+    m_alignGroup->addAction(ui->actionAlignJustify);
 
     ui->mainToolBar->addWidget(m_fontCombo);
     ui->mainToolBar->addWidget(m_sizeSpin);
@@ -97,6 +108,11 @@ void MainWindow::buildToolBar()
     ui->mainToolBar->addAction(ui->actionBold);
     ui->mainToolBar->addAction(ui->actionItalic);
     ui->mainToolBar->addAction(ui->actionUnderline);
+    ui->mainToolBar->addSeparator();
+    ui->mainToolBar->addAction(ui->actionAlignLeft);
+    ui->mainToolBar->addAction(ui->actionAlignCenter);
+    ui->mainToolBar->addAction(ui->actionAlignRight);
+    ui->mainToolBar->addAction(ui->actionAlignJustify);
     ui->mainToolBar->addSeparator();
     ui->mainToolBar->addWidget(new QLabel(QStringLiteral("段落"), ui->mainToolBar));
     ui->mainToolBar->addWidget(m_styleCombo);
@@ -106,14 +122,44 @@ void MainWindow::buildToolBar()
     ui->mainToolBar->addAction(ui->actionZoomActual);
 }
 
+bool MainWindow::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == ui->scrollArea->viewport() && event->type() == QEvent::Wheel) {
+        auto* wheel = static_cast<QWheelEvent*>(event);
+        if (wheel->modifiers().testFlag(Qt::ControlModifier)) {
+            int delta = wheel->angleDelta().y();
+            if (delta == 0) {
+                delta = wheel->pixelDelta().y();
+            }
+            if (delta != 0) {
+                emit ui->canvas->zoomWheelRequested(delta, wheel->globalPosition());
+                wheel->accept();
+                return true;
+            }
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::newDocument() { showResult(QStringLiteral("已新建空白文档 (待接入IO模块)")); }
 void MainWindow::exportWord() { showResult(QStringLiteral("导出入口已触发 (待接入IO模块)")); }
-void MainWindow::onPointerMoved(const QPointF& paperPoint) { m_pointerLabel->setText(QStringLiteral("纸张坐标：(%1, %2)").arg(qRound(paperPoint.x())).arg(qRound(paperPoint.y()))); }
+void MainWindow::onPointerMoved(const QPointF& paperPoint)
+{
+    if (m_pointerLabel) {
+        m_pointerLabel->setText(QStringLiteral("纸张坐标：(%1, %2)").arg(qRound(paperPoint.x())).arg(qRound(paperPoint.y())));
+    }
+}
 void MainWindow::applyFontFamily(const QFont& font) { showResult("更改字体：" + font.family()); }
 void MainWindow::applyBold(bool checked) { showResult(checked ? "加粗：开" : "加粗：关"); }
 void MainWindow::applyItalic(bool checked) { showResult(checked ? "斜体：开" : "斜体：关"); }
 void MainWindow::applyUnderline(bool checked) { showResult(checked ? "下划线：开" : "下划线：关"); }
+void MainWindow::applyAlignment() { showResult(QStringLiteral("更改段落对齐")); }
 void MainWindow::applyParagraphStyle(int index) { showResult("更改段落样式"); }
+void MainWindow::onZoomWheel(int angleDeltaY, const QPointF&)
+{
+    const qreal factor = std::pow(1.1, static_cast<qreal>(angleDeltaY) / 120.0);
+    setZoom(ui->canvas->zoom() * factor);
+}
 
 void MainWindow::setZoom(qreal zoom)
 {
@@ -139,7 +185,12 @@ void MainWindow::setZoom(qreal zoom)
 
 void MainWindow::updateStatus()
 {
-    m_zoomLabel->setText(QStringLiteral("缩放：%1%").arg(qRound(ui->canvas->zoom() * 100.0)));
+    if (m_zoomLabel) {
+        m_zoomLabel->setText(QStringLiteral("缩放：%1%").arg(qRound(ui->canvas->zoom() * 100.0)));
+    }
+    if (!m_overflowLabel) {
+        return;
+    }
     const QRectF& page = m_layoutResult.pageRect;
     const QRectF& bounds = m_layoutResult.layoutBounds;
 
@@ -167,6 +218,8 @@ void MainWindow::updateStatus()
 
 void MainWindow::showResult(const QString& text)
 {
-    m_resultLabel->setText(text);
+    if (m_resultLabel) {
+        m_resultLabel->setText(text);
+    }
     statusBar()->showMessage(text, 3000);
 }
