@@ -9,6 +9,8 @@ class MainWindow;
 }
 
 class CanvasWidget;
+class QActionGroup;
+class QEvent;
 class QLabel;
 class QFontComboBox;
 class QDoubleSpinBox;
@@ -26,6 +28,9 @@ public:
     void updateLayoutData(const editor::data::DocumentSnapshot& snapshot,
                           const editor::data::LayoutResult& result);
 
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private slots:
     void newDocument();
     void exportWord();
@@ -34,7 +39,9 @@ private slots:
     void applyBold(bool checked);
     void applyItalic(bool checked);
     void applyUnderline(bool checked);
+    void applyAlignment();
     void applyParagraphStyle(int index);
+    void onZoomWheel(int angleDeltaY, const QPointF& globalPos);
 
 private:
     void buildToolBar();
@@ -50,6 +57,7 @@ private:
     QFontComboBox* m_fontCombo = nullptr;
     QDoubleSpinBox* m_sizeSpin = nullptr;
     QComboBox* m_styleCombo = nullptr;
+    QActionGroup* m_alignGroup = nullptr;
 
     QLabel* m_pointerLabel = nullptr;
     QLabel* m_caretLabel = nullptr;

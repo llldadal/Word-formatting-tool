@@ -34,15 +34,21 @@ public:
     QPointF paperToWidget(const QPointF& paperPoint) const;
     QPointF widgetToPaper(const QPointF& widgetPoint) const;
     QRectF caretRectInWidget() const;
+    bool isCaretVisible() const { return m_caretVisible; }
+    void resetCaretBlink();
+    void setCaretBlinking(bool active);
 
 signals:
     void pointerMoved(const QPointF& paperPoint);
+    void caretBlinkChanged(bool visible);
+    void zoomWheelRequested(int angleDeltaY, const QPointF& globalPos);
 
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void wheelEvent(QWheelEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void focusInEvent(QFocusEvent* event) override;
     void focusOutEvent(QFocusEvent* event) override;
