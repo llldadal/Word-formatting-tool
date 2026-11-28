@@ -42,7 +42,7 @@ public:
         const data::DocumentSnapshot& snapshot,
         qreal zoom = 1.0);
 
-    // 计算图片拖拽（支持文本内浮动绕排跨容器迁移，也支持顶层/分组流式重排）
+    // 计算图片拖拽（v0.2 浮动图仅允许在原父文本容器内移动并保留原下标；顺序图片支持顶层/分组流式同级重排）
     static DragDropPlan planImageMove(
         const data::ContainerId& draggedImageId,
         const data::ContainerId& initialParentId,

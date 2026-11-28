@@ -22,6 +22,51 @@ const data::ContainerNode* findNodeInTree(const data::ContainerNode& root, const
     return nullptr;
 }
 
+data::ContainerNode* findNodeInTreeMutable(data::ContainerNode& root, const data::ContainerId& id)
+{
+    if (root.id == id)
+        return &root;
+    for (auto& child : root.children) {
+        if (auto* found = findNodeInTreeMutable(child, id))
+            return found;
+    }
+    return nullptr;
+}
+
+bool finitePositive(qreal v)
+{
+    return std::isfinite(v) && v > 0.0;
+}
+
+qreal pageContentWidth(const data::DocumentSnapshot& snapshot, const data::LayoutResult& baseLayout)
+{
+    if (snapshot.page.size.width() > 0.0) {
+        return snapshot.page.size.width() - snapshot.page.margins.left() - snapshot.page.margins.right();
+    }
+    return baseLayout.contentRect.width();
+}
+
+qreal computedContentWidth(const data::ContainerGeometry& geometry, qreal parentWidth)
+{
+    const qreal frameWidth = geometry.width == 0
+        ? (parentWidth - geometry.margin.left() - geometry.margin.right())
+        : geometry.width;
+    return frameWidth - geometry.padding.right() - geometry.padding.left();
+}
+
+qreal targetParentContentWidth(
+    const data::DocumentSnapshot& snapshot,
+    const data::LayoutResult& baseLayout,
+    const data::ContainerNode* parentNode)
+{
+    if (!parentNode)
+        return 0.0;
+    const qreal pageW = pageContentWidth(snapshot, baseLayout);
+    if (parentNode == &snapshot.root)
+        return pageW;
+    return computedContentWidth(parentNode->geometry, pageW);
+}
+
 bool findNodeParentAndIndex(
     const data::ContainerNode& root,
     const data::ContainerId& id,
@@ -226,6 +271,10 @@ DragDropPlan ContainerDragEngine::planContainerMove(
     std::size_t initialIndex = 0;
     findNodeParentAndIndex(snapshot.root, draggedId, initialParentId, initialIndex);
     const auto* draggedNode = findNodeInTree(snapshot.root, draggedId);
+    if (!draggedNode || draggedId == snapshot.root.id) {
+        plan.isValid = false;
+        return plan;
+    }
 
     const qreal safeZoom = qMax<qreal>(0.25, zoom);
     const qreal snapThreshold = kBaseSnapThresholdPx / safeZoom;
@@ -240,26 +289,56 @@ DragDropPlan ContainerDragEngine::planContainerMove(
     plan.targetParentContentRect = baseLayout.contentRect;
 
     // 1. 如果是叶节点文本容器（无子浮动图片），检测是否拖入了某个 Group 分组容器
-    const bool isLeaf = !draggedNode || draggedNode->children.empty();
+    const bool isLeaf = draggedNode->children.empty();
     if (draggedType == data::ContainerType::Text && isLeaf) {
         for (const auto& box : baseLayout.containers) {
             if (box.containerId == draggedId || box.containerId == snapshot.root.id)
                 continue;
+            if (!box.contentRect.contains(paperPos) && !box.rect.contains(targetRect.center()))
+                continue;
+
             const auto* node = findNodeInTree(snapshot.root, box.containerId);
-            if (node && node->type == data::ContainerType::Group) {
-                if (box.contentRect.contains(paperPos) || box.rect.contains(targetRect.center())) {
-                    plan.targetParentId = box.containerId;
-                    plan.targetParentContentRect = box.contentRect;
-                    plan.targetParentHighlightRect = box.rect;
-                    break;
-                }
+            if (!node || node->type != data::ContainerType::Group)
+                continue;
+
+            // Document::moveNode 只允许根和顶层容器接收子节点。
+            const auto& topLevel = snapshot.root.children;
+            if (std::none_of(topLevel.begin(), topLevel.end(),
+                             [&box](const auto& child) { return child.id == box.containerId; })) {
+                plan.guidelines.clear();
+                plan.isValid = false;
+                return plan;
             }
+
+            plan.targetParentId = box.containerId;
+            plan.targetParentContentRect = box.contentRect;
+            plan.targetParentHighlightRect = box.rect;
+            break;
         }
     }
 
     const auto* parentNode = (plan.targetParentId == snapshot.root.id)
         ? &snapshot.root
         : findNodeInTree(snapshot.root, plan.targetParentId);
+    if (!parentNode) {
+        plan.isValid = false;
+        return plan;
+    }
+
+    // 与 Document::moveNode() 保持一致：跨父容器移动文本/分组时校验目标父容器可用内容宽度必须为正
+    if (plan.targetParentId != initialParentId &&
+        (draggedNode->type == data::ContainerType::Text || draggedNode->type == data::ContainerType::Group)) {
+        const qreal parentW = targetParentContentWidth(snapshot, baseLayout, parentNode);
+        const qreal childContentW = computedContentWidth(draggedNode->geometry, parentW);
+        if (!finitePositive(parentW) || !finitePositive(childContentW)) {
+            plan.targetParentHighlightRect = QRectF();
+            plan.insertionIndicator.reset();
+            plan.guidelines.clear();
+            plan.placementMode = data::PlacementMode::Flow;
+            plan.isValid = false;
+            return plan;
+        }
+    }
 
     computeFlowOrderAndIndicator(
         parentNode, draggedId, initialParentId, initialIndex,
@@ -305,13 +384,17 @@ DragDropPlan ContainerDragEngine::planImageMove(
     const qreal safeZoom = qMax<qreal>(0.25, zoom);
     const qreal snapThreshold = kBaseSnapThresholdPx / safeZoom;
 
-    QRectF targetRect = initialRect.translated(delta);
+    const QRectF rawTargetRect = initialRect.translated(delta);
+    QRectF targetRect = rawTargetRect;
     auto snap = SnapEngine::snapMove(targetRect, baseLayout, draggedImageId, snapThreshold, /*snapY=*/!originallyFlow);
     targetRect.moveTopLeft(snap.snappedTopLeft);
 
     plan.targetRect = targetRect;
     plan.guidelines = std::move(snap.guidelines);
 
+#if 0
+    // v0.2 验收要求浮动图只能在原父容器内移动，越界回退。
+    // 下方跨文本容器浮动迁移代码暂注释保留，后续版本需要时再恢复。
     // 寻找包含鼠标指针或图片中心的目标文本容器（用于跨容器浮动绕排迁移）
     const data::ContainerLayout* bestBox = nullptr;
     qreal maxOverlapArea = -1;
@@ -363,8 +446,9 @@ DragDropPlan ContainerDragEngine::planImageMove(
         plan.isValid = true;
         return plan;
     }
+#endif
 
-    // 未落在任何文本容器内：若原本为顺序图片则保持顺序重排，否则回落到原文本父容器
+    // 顺序图片：保持在原父容器（root 或 Group）内做同级顺序重排
     if (originallyFlow) {
         plan.targetParentId = actualParentId.isEmpty() ? snapshot.root.id : actualParentId;
         if (plan.targetParentId == snapshot.root.id) {
@@ -397,24 +481,65 @@ DragDropPlan ContainerDragEngine::planImageMove(
         return plan;
     }
 
+    // 浮动图片：仅允许在原父文本容器可用内容区内移动，保持原父级和原下标，越界则标记为非法以便回退
     plan.targetParentId = actualParentId;
-    if (const auto* initBox = findBoxInLayout(baseLayout, actualParentId)) {
-        plan.targetParentContentRect = initBox->contentRect;
-    } else {
-        plan.targetParentContentRect = baseLayout.contentRect;
+    plan.targetIndex = initialIndex;
+    plan.placementMode = data::PlacementMode::Floating;
+
+    const auto* initBox = findBoxInLayout(baseLayout, actualParentId);
+    if (!initBox || !initBox->contentRect.isValid()) {
+        plan.guidelines.clear();
+        plan.isValid = false;
+        return plan;
     }
 
-    const auto* targetNode = findNodeInTree(snapshot.root, plan.targetParentId);
-    plan.targetIndex = targetNode ? targetNode->children.size() : 0;
+    const QRectF parentContentRect = initBox->contentRect;
+    plan.targetParentContentRect = parentContentRect;
 
-    const qreal maxRelX = qMax<qreal>(0, plan.targetParentContentRect.width() - targetRect.width());
-    const qreal relX = qBound<qreal>(0, targetRect.left() - plan.targetParentContentRect.left(), maxRelX);
-    const qreal relY = qMax<qreal>(0, targetRect.top() - plan.targetParentContentRect.top());
-    targetRect.moveTopLeft(QPointF(plan.targetParentContentRect.left() + relX,
-                                   plan.targetParentContentRect.top() + relY));
+    // 原始落点在允许区域内时，撤掉会把图片拉出边界的那个方向的吸附。
+    const QRectF frameBounds = baseLayout.pageRect.isValid()
+        ? parentContentRect.intersected(baseLayout.pageRect)
+        : parentContentRect;
+    if (frameBounds.contains(rawTargetRect) && !frameBounds.contains(targetRect)) {
+        const bool cancelX = targetRect.left() < frameBounds.left() || targetRect.right() > frameBounds.right();
+        const bool cancelY = targetRect.top() < frameBounds.top() || targetRect.bottom() > frameBounds.bottom();
+        if (cancelX)
+            targetRect.moveLeft(rawTargetRect.left());
+        if (cancelY)
+            targetRect.moveTop(rawTargetRect.top());
+
+        const auto canceledGuideline = [cancelX, cancelY](const Guideline& guideline) {
+            return guideline.orientation == GuidelineOrientation::Vertical ? cancelX : cancelY;
+        };
+        plan.guidelines.erase(std::remove_if(plan.guidelines.begin(), plan.guidelines.end(), canceledGuideline),
+                              plan.guidelines.end());
+    }
+
+    constexpr qreal kBoundEps = 0.5;
+    const QRectF allowedContent = parentContentRect.adjusted(-kBoundEps, -kBoundEps, kBoundEps, kBoundEps);
+    const QRectF allowedPointer = initBox->rect.adjusted(-kBoundEps, -kBoundEps, kBoundEps, kBoundEps);
+    const bool inParent = allowedContent.contains(targetRect) && allowedPointer.contains(paperPos);
+    const bool inPage = !baseLayout.pageRect.isValid() ||
+        (baseLayout.pageRect.adjusted(-kBoundEps, -kBoundEps, kBoundEps, kBoundEps).contains(targetRect) &&
+         baseLayout.pageRect.adjusted(-kBoundEps, -kBoundEps, kBoundEps, kBoundEps).contains(paperPos));
+
+    if (!inParent || !inPage) {
+        plan.guidelines.clear();
+        if (const auto* imgNode = findNodeInTree(snapshot.root, draggedImageId)) {
+            plan.localPosition = imgNode->geometry.position;
+        }
+        plan.isValid = false;
+        return plan;
+    }
+
+    const qreal maxRelX = qMax<qreal>(0.0, parentContentRect.width() - targetRect.width());
+    const qreal maxRelY = qMax<qreal>(0.0, parentContentRect.height() - targetRect.height());
+    const qreal relX = qBound<qreal>(0.0, targetRect.left() - parentContentRect.left(), maxRelX);
+    const qreal relY = qBound<qreal>(0.0, targetRect.top() - parentContentRect.top(), maxRelY);
+    targetRect.moveTopLeft(QPointF(parentContentRect.left() + relX,
+                                   parentContentRect.top() + relY));
     plan.targetRect = targetRect;
     plan.localPosition = QPointF(relX, relY);
-    plan.placementMode = data::PlacementMode::Floating;
     plan.isValid = true;
     return plan;
 }
@@ -672,29 +797,36 @@ bool ContainerDragEngine::applyPlanToCandidateSnapshot(
     const DragDropPlan& plan,
     const data::ContainerGeometry& geometry)
 {
+    if (!plan.isValid)
+        return false;
+
     data::ContainerNode* currentParent = nullptr;
     data::ContainerNode* node = findNodeAndParentInTree(candidate.root, draggedId, nullptr, &currentParent);
     if (!node || !currentParent)
         return false;
 
-    node->geometry = geometry;
-    node->geometry.position = plan.localPosition;
-    if (plan.targetDisplaySize.has_value() && node->type == data::ContainerType::Image) {
-        node->image.displaySize = *plan.targetDisplaySize;
-    }
-
     // 仅在原地调整尺寸/几何时，不改变父级与兄弟排序
     if (plan.targetParentId.isEmpty() || plan.targetDisplaySize.has_value()) {
+        node->geometry = geometry;
+        node->geometry.position = plan.localPosition;
+        if (plan.targetDisplaySize.has_value() && node->type == data::ContainerType::Image) {
+            node->image.displaySize = *plan.targetDisplaySize;
+        }
         return true;
     }
 
     const auto resolvedTargetParentId = plan.targetParentId;
-    data::ContainerNode* targetParent = (resolvedTargetParentId == candidate.root.id)
-        ? &candidate.root
-        : const_cast<data::ContainerNode*>(findNodeInTree(candidate.root, resolvedTargetParentId));
-    if (!targetParent || targetParent->id == draggedId)
+    if (resolvedTargetParentId == draggedId)
         return false;
 
+    data::ContainerNode* targetParent = (resolvedTargetParentId == candidate.root.id)
+        ? &candidate.root
+        : findNodeInTreeMutable(candidate.root, resolvedTargetParentId);
+    if (!targetParent || findNodeInTree(*node, resolvedTargetParentId) != nullptr)
+        return false;
+
+    node->geometry = geometry;
+    node->geometry.position = plan.localPosition;
     node->placement = plan.placementMode;
 
     if (currentParent == targetParent) {
@@ -716,9 +848,18 @@ bool ContainerDragEngine::applyPlanToCandidateSnapshot(
         if (it != currentParent->children.end()) {
             data::ContainerNode extracted = std::move(*it);
             currentParent->children.erase(it);
-            const auto insertIdx = qMin<std::size_t>(plan.targetIndex, targetParent->children.size());
-            targetParent->children.insert(targetParent->children.begin() + static_cast<std::ptrdiff_t>(insertIdx),
-                                          std::move(extracted));
+
+            // 删除节点后 vector 可能重新排布，必须按 ID 重新查找目标父容器
+            data::ContainerNode* freshTargetParent = (resolvedTargetParentId == candidate.root.id)
+                ? &candidate.root
+                : findNodeInTreeMutable(candidate.root, resolvedTargetParentId);
+            if (!freshTargetParent)
+                return false;
+
+            const auto insertIdx = qMin<std::size_t>(plan.targetIndex, freshTargetParent->children.size());
+            freshTargetParent->children.insert(
+                freshTargetParent->children.begin() + static_cast<std::ptrdiff_t>(insertIdx),
+                std::move(extracted));
         }
     }
     return true;
